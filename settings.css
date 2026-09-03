@@ -1,0 +1,20 @@
+.gdrs-settings { display: flex; flex-direction: column; gap: 1.15rem; color: #e2e8f0; }
+.gdrs-settings-field { min-width: 0; }
+.gdrs-settings-field > label { display: block; margin-bottom: .4rem; color: #fff; font-size: .88rem; font-weight: 700; }
+.gdrs-settings input[type="text"], .gdrs-settings input[type="number"], .gdrs-settings select { width: 100%; max-width: 508px; box-sizing: border-box; padding: .6rem .8rem; color: #fff; background: rgba(15,23,42,.6); border: 1px solid rgba(255,255,255,.1); border-radius: 6px; outline: none; }
+.gdrs-settings input:focus, .gdrs-settings select:focus { border-color: #a855f7; }
+.gdrs-settings-input-row { display: flex; align-items: center; gap: .55rem; max-width: 650px; }
+.gdrs-settings-input-row input { flex: 1 1 auto; max-width: none !important; }
+.gdrs-settings-check-btn { flex: 0 0 auto; padding: .58rem .9rem; border: 1px solid rgba(168,85,247,.65); border-radius: 6px; color: #e9d5ff; background: rgba(126,34,206,.25); cursor: pointer; white-space: nowrap; }
+.gdrs-settings-check-btn:disabled { opacity: .55; cursor: wait; }
+.gdrs-settings-help, .gdrs-settings-result { max-width: 760px; margin: .4rem 0 0; color: #94a3b8; font-size: .76rem; line-height: 1.5; }
+.gdrs-settings-result:empty { display: none; }
+.gdrs-settings-result.is-ok { color: #4ade80; }
+.gdrs-settings-result.is-warn { color: #fbbf24; }
+.gdrs-settings-result.is-error { color: #fb7185; }
+.gdrs-settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 508px)); gap: 1.15rem 1.5rem; }
+.gdrs-settings-grid-numbers { grid-template-columns: repeat(4, minmax(120px, 235px)); }
+.gdrs-settings-check { display: flex !important; align-items: center; gap: .5rem; margin: 0 !important; color: #fff; font-size: .88rem; font-weight: 700; }
+.gdrs-settings-checkbox-field { padding-top: 1.75rem; }
+.gdrs-settings code { color: #c4b5fd; }
+@media (max-width: 900px) { .gdrs-settings-grid, .gdrs-settings-grid-numbers { grid-template-columns: 1fr; } .gdrs-settings-checkbox-field { padding-top: 0; } }

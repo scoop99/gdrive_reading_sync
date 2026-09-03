@@ -1,0 +1,353 @@
+.gdrs-plugin-container {
+  padding: 24px;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 auto;
+  color: var(--app-text-primary);
+  font-family: inherit;
+}
+
+.gdrs-header-banner {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  margin-bottom: 24px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--app-border-light);
+  gap: 14px;
+}
+
+.gdrs-title-group {
+  min-width: 0;
+}
+
+.gdrs-title-group h2 {
+  font-size: 1.6rem;
+  font-weight: 700;
+  margin: 0 0 6px 0;
+  color: var(--app-text-primary);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.gdrs-subtitle {
+  margin: 0;
+  color: var(--app-text-muted);
+  font-size: 0.9rem;
+  white-space: nowrap;
+  overflow-x: auto;
+}
+
+.gdrs-status-card {
+  background: var(--app-bg-card);
+  border: 1px solid var(--app-border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 24px;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  overflow-x: auto;
+  box-shadow: var(--app-shadow, 0 2px 8px rgba(0, 0, 0, 0.08));
+}
+
+.gdrs-status-row {
+  display: flex;
+  align-items: center;
+  font-size: 0.85rem;
+  color: var(--app-text-primary);
+  gap: 8px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.gdrs-status-row code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.84rem;
+  color: var(--app-text-secondary);
+  white-space: nowrap;
+  line-height: 1.5;
+}
+
+.gdrs-status-label {
+  color: var(--app-text-muted);
+}
+
+.gdrs-status-error code {
+  color: #f87171;
+}
+
+/* §4.4 — preflight 한 줄. 기존 gdrs-status-row code 스타일을 그대로 쓴다. */
+#gdrs-preflight.gdrs-preflight-ok {
+  color: #16a34a;
+}
+#gdrs-preflight.gdrs-preflight-fail {
+  color: #dc2626;
+}
+
+.gdrs-jobs-panel {
+  background: var(--app-bg-card);
+  border: 1px solid var(--app-border);
+  border-radius: 12px;
+  padding: 18px 20px;
+  box-shadow: var(--app-shadow, 0 4px 12px rgba(0, 0, 0, 0.08));
+}
+
+.gdrs-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  margin-bottom: 12px;
+}
+
+.gdrs-panel-header h3 {
+  font-size: 1.05rem;
+  margin: 0;
+  color: var(--app-text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.gdrs-panel-note {
+  font-size: 0.85rem;
+  color: var(--app-text-muted);
+}
+
+/* 툴바 아래 한 줄. 툴바 안에 두면 컨트롤 자리를 뺏어 글자가 세로로 접힌다. */
+.gdrs-panel-note-row {
+  margin: 0 0 8px 0;
+  min-height: 1.2em;
+}
+
+.gdrs-jobs-table-wrap {
+  overflow-x: auto;
+}
+
+.gdrs-jobs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.gdrs-jobs-table th,
+.gdrs-jobs-table td {
+    text-align: left;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--app-border-light);
+    color: var(--app-text-primary);
+}
+
+.gdrs-jobs-table th {
+    font-weight: 600;
+    color: var(--app-text-muted);
+    background: var(--app-bg-sidebar);
+    position: sticky;
+    top: 0;
+}
+
+/* B-7 — KST 날짜가 오늘이면 HH:mm:ss, 어제 이전은 YYYY-MM-DD HH:mm */
+.gdrs-date-cell { white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+/* 경로가 핵심 정보다. 너무 좁게 잘라 두면 무슨 파일인지 알 수 없다.
+ * 넓게 주고 뒤를 ellipsis 로 자르며, 전체 경로는 title 툴팁으로 본다. */
+.gdrs-path-cell {
+    max-width: 640px;
+    min-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.gdrs-path-cell[title] { cursor: help; }
+.gdrs-result-cell,
+.gdrs-size-cell,
+.gdrs-bytes-cell { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.gdrs-col-check { width: 28px; }
+.gdrs-id-cell { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.gdrs-row-error {
+    font-size: 0.8rem;
+    color: #dc2626;
+    margin-top: 2px;
+    white-space: normal; /* 줄바꿈 허용 — 에러는 한 줄로 끊으면 가독성 */
+}
+.gdrs-prev-path {
+    font-size: 0.8rem;
+    color: var(--app-text-muted);
+    margin-top: 2px;
+}
+
+.gdrs-jobs-table tr:hover td {
+  background: var(--app-bg-card-hover);
+}
+
+.gdrs-jobs-table code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.84rem;
+  color: var(--app-text-secondary);
+}
+
+.gdrs-status-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  background: var(--app-accent);
+  color: #ffffff;
+}
+
+/* FF bookoasis_mate gdrive_scan 과 같은 색 배분: 진행=파랑, 종결=초록,
+   주의=주황, 실패=빨강. 2단계 상태가 붙어도 규칙이 그대로 이어진다. */
+.gdrs-status-dry_run { background: #64748b; }
+.gdrs-status-queued,
+.gdrs-status-retry { background: #f59e0b; }
+.gdrs-status-processing { background: var(--app-accent); }
+.gdrs-status-completed { background: #16a34a; }
+.gdrs-status-skipped { background: #94a3b8; }
+.gdrs-status-failed { background: #dc2626; }
+
+.gdrs-action-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: #ffffff;
+  background: #64748b;
+}
+
+.gdrs-action-create { background: #16a34a; }
+.gdrs-action-edit { background: #2563eb; }
+.gdrs-action-rename,
+.gdrs-action-move { background: #a855f7; }
+.gdrs-action-delete { background: #dc2626; }
+.gdrs-action-restore { background: #0891b2; }
+
+.gdrs-filter-group {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  flex: 1 1 420px;
+}
+
+/* white-space:nowrap 이 없으면 폭이 부족할 때 버튼 글자가 한 글자씩 세로로 접힌다. */
+.gdrs-select,
+.gdrs-search,
+.gdrs-btn {
+    padding: 6px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--app-border);
+    background: var(--app-surface);
+    color: var(--app-text-primary);
+    font-size: 0.85rem;
+    line-height: 1.4;
+    white-space: nowrap;
+    flex: 0 0 auto;
+    cursor: pointer;
+}
+/* opacity:0.5 만 주면 강조색 배경 위에서 글자가 배경에 묻힌다.
+ * 비활성은 배경을 걷어내고 테두리·글자만 흐리게 한다. */
+.gdrs-btn:disabled {
+    background: transparent;
+    color: var(--app-text-muted);
+    border-color: var(--app-border-light, var(--app-border));
+    opacity: 0.75;
+    cursor: not-allowed;
+}
+.gdrs-btn-primary { background: var(--app-accent); color: #fff; border-color: var(--app-accent); }
+.gdrs-btn-secondary { background: transparent; }
+/* 파괴적 동작은 평소엔 윤곽선만. 화면에서 제일 눈에 띄는 것이 삭제 버튼이면 안 된다. */
+.gdrs-btn-danger {
+    background: transparent;
+    color: #ef4444;
+    border-color: #ef4444;
+}
+.gdrs-btn-danger:hover { background: #dc2626; color: #fff; border-color: #dc2626; }
+
+.gdrs-search { min-width: 180px; }
+
+/* B-1 — Windows 가 드롭다운 옵션을 시스템 흰 배경으로 그려 글자가 안 보이는 결함.
+ * .gdrs-select option 에 어두운 배경 + 밝은 글자색을 명시. dropdown 의 실제 옵션
+ * 패널이 자체 element (select option) 라 app-text-primary 상속이 끊기므로 강제 색을
+ * 다시 잡는다. */
+.gdrs-select option {
+    background: var(--app-bg-card);
+    color: var(--app-text-primary);
+}
+
+.gdrs-empty {
+    text-align: center;
+    color: var(--app-text-muted);
+    padding: 24px 0;
+}
+
+.gdrs-progress-bar {
+    background: var(--app-bg-card);
+    border: 1px solid var(--app-border);
+    border-radius: 8px;
+    padding: 6px 14px;
+    margin-bottom: 12px;
+    font-size: 0.85rem;
+    color: var(--app-text-primary);
+}
+
+.gdrs-action-group {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex-wrap: nowrap;
+}
+
+.gdrs-pagination {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+    padding: 10px 0 0 0;
+}
+.gdrs-pagination button {
+    padding: 3px 9px;
+    border-radius: 4px;
+    border: 1px solid var(--app-border);
+    background: var(--app-surface);
+    color: var(--app-text-primary);
+    cursor: pointer;
+    font-size: 0.84rem;
+}
+.gdrs-pagination button.active {
+    background: var(--app-accent);
+    color: #fff;
+    border-color: var(--app-accent);
+}
+.gdrs-pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.gdrs-result-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #fff;
+    background: #475569;
+}
+.gdrs-result-copied { background: #16a34a; }
+.gdrs-result-duplicate { background: #94a3b8; }
+.gdrs-result-renamed_event,
+.gdrs-result-renamed_cold_start,
+.gdrs-result-renamed_directory { background: #a855f7; }
+.gdrs-result-remote_deleted { background: #6b7280; }
+.gdrs-result-max_attempts_exceeded,
+.gdrs-result-recovery_limit_exceeded,
+.gdrs-result-recovered_tmp_cleanup_failed { background: #dc2626; }
+
+.gdrs-attempts-over { color: #f59e0b; font-weight: 600; }

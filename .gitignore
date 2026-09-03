@@ -1,0 +1,42 @@
+__pycache__/
+*.pyc
+.venv/
+.orca-work/
+*.log
+
+# secrets / local runtime — never commit
+.env
+.env.*
+*.pem
+*.key
+*.p12
+credentials.json
+token.json
+client_secret*.json
+rclone.conf
+.oauth*
+
+# plugin/runtime state (page tokens, local sqlite)
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# local overrides
+*.local
+*.local.*
+config.local.*
+secrets/
+
+# work byproducts (local only)
+scratch/
+*_snap.txt
+snapshot*.txt
+*.bak-*
+
+# 개인 운영 도구 — 공개 저장소에 넣지 않는다
+scripts/
+
+# 개인 문서 — 공개 저장소에 넣지 않는다 (개인 경로·작업 이력)
+docs/
+STATUS.md

@@ -1,0 +1,101 @@
+<div class="gdrs-plugin-container">
+  <div class="gdrs-header-banner">
+    <div class="gdrs-title-group">
+      <h2><i class="fa-solid fa-cloud-arrow-down"></i> 구드 독서 동기화</h2>
+      <p class="gdrs-subtitle">Google Drive의 생성·수정 파일을 BookOasis로 동기화하고, 이름 변경과 삭제 이력을 추적합니다.</p>
+    </div>
+    <div class="gdrs-status-card" id="gdrs-status-card">
+      <span class="gdrs-status-row"><span class="gdrs-status-label">상태</span><strong id="gdrs-status-val">-</strong></span>
+      <span class="gdrs-status-row"><span class="gdrs-status-label">마지막 폴링</span><span id="gdrs-last-poll">-</span></span>
+      <span class="gdrs-status-row"><span class="gdrs-status-label">page_token</span><code id="gdrs-token">-</code></span>
+      <span class="gdrs-status-row"><span class="gdrs-status-label">preflight</span><code id="gdrs-preflight">미확인</code></span>
+      <span class="gdrs-status-row gdrs-status-error" id="gdrs-error-row" hidden>
+        <span class="gdrs-status-label">에러</span><code id="gdrs-error-text"></code>
+      </span>
+    </div>
+  </div>
+
+  <div class="gdrs-progress-bar" id="gdrs-progress-bar">
+    <span class="gdrs-progress-summary" id="gdrs-progress-summary">불러오는 중…</span>
+  </div>
+
+  <div class="gdrs-jobs-panel">
+    <div class="gdrs-panel-header">
+      <h3><i class="fa-solid fa-list-check"></i> 변경 이벤트</h3>
+      <div class="gdrs-filter-group">
+        <select id="gdrs-filter-status" class="gdrs-select" title="상태">
+          <option value="">전체 상태</option>
+          <option value="queued">대기</option>
+          <option value="retry">재시도</option>
+          <option value="processing">처리 중</option>
+          <option value="completed">완료</option>
+          <option value="skipped">건너뜀</option>
+          <option value="failed">실패</option>
+        </select>
+        <select id="gdrs-filter-action" class="gdrs-select" title="변경 유형">
+          <option value="">전체 변경</option>
+          <option value="create">생성</option>
+          <option value="edit">수정</option>
+          <option value="rename">이름 변경</option>
+          <option value="delete">삭제</option>
+        </select>
+        <select id="gdrs-filter-result" class="gdrs-select" title="처리 결과">
+          <option value="">전체 결과</option>
+          <option value="copied">복사 완료</option>
+          <option value="duplicate">중복</option>
+          <option value="renamed_event">이름 변경</option>
+          <option value="renamed_cold_start">초기 이름 변경</option>
+          <option value="renamed_directory">폴더 이름 변경</option>
+          <option value="remote_deleted">원격 삭제</option>
+          <option value="max_attempts_exceeded">시도 횟수 초과</option>
+          <option value="recovery_limit_exceeded">복구 한도 초과</option>
+        </select>
+        <input id="gdrs-filter-search" class="gdrs-search" placeholder="경로/오류 검색 (서버측)">
+        <select id="gdrs-page-size" class="gdrs-select" title="페이지 크기">
+          <option value="50">50</option>
+          <option value="100" selected>100</option>
+          <option value="200">200</option>
+          <option value="500">500</option>
+        </select>
+        <select id="gdrs-filter-order" class="gdrs-select" title="정렬">
+          <option value="desc" selected>최신순</option>
+          <option value="asc">과거순</option>
+        </select>
+        <button id="gdrs-search-btn" class="gdrs-btn" type="button">검색</button>
+        <button id="gdrs-reset-btn" class="gdrs-btn gdrs-btn-secondary" type="button">초기화</button>
+      </div>
+      <div class="gdrs-action-group">
+        <button id="gdrs-retry-selected" class="gdrs-btn gdrs-btn-primary" type="button" disabled>선택 재처리</button>
+        <button id="gdrs-retry-failed-all" class="gdrs-btn" type="button">실패 재처리</button>
+        <button id="gdrs-cleanup-retention" class="gdrs-btn" type="button">기간 삭제</button>
+        <button id="gdrs-cleanup-all" class="gdrs-btn gdrs-btn-danger" type="button">이력 삭제</button>
+      </div>
+    </div>
+    <!-- 안내문은 툴바 밖으로. 툴바 안에 두면 컨트롤 자리를 뺏어 글자가 세로로 접힌다. -->
+    <div class="gdrs-panel-note-row">
+      <span class="gdrs-panel-note" id="gdrs-jobs-note">불러오는 중…</span>
+    </div>
+    <div class="gdrs-jobs-table-wrap">
+      <table class="gdrs-jobs-table" id="gdrs-jobs-table">
+        <thead>
+          <tr>
+            <th class="gdrs-col-check"><input type="checkbox" id="gdrs-select-all" title="현재 페이지 전체 선택"></th>
+            <th>id</th>
+            <th>변경</th>
+            <th>상태</th>
+            <th>결과</th>
+            <th>경로</th>
+            <th>크기</th>
+            <th>처리량</th>
+            <th>수정</th>
+            <th>수신</th>
+          </tr>
+        </thead>
+        <tbody id="gdrs-jobs-body">
+          <tr><td colspan="10" class="gdrs-empty">데이터 없음</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="gdrs-pagination" id="gdrs-pagination"></div>
+  </div>
+</div>

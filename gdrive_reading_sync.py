@@ -1,0 +1,804 @@
+# -*- coding: utf-8 -*-
+"""BookOasis metadata plugin: gdrive_reading_sync (1단계: 감지 + 화면).
+
+- 복사/스캔/삭제 코드 없음 (job.status='dry_run' 고정)
+- rclone copy/sync/move/delete/purge 일체 호출 금지
+- Drive 토큰은 utils.rclone_gdrive_copy.get_access_token 재사용 (캐시 포함)
+- 백그라운드는 daemon thread 1개 + 라우트는 gamebooks의 _do_register_routes 패턴 그대로
+"""
+from __future__ import annotations
+
+import glob as _glob
+import logging
+import logging.handlers
+import sys
+import threading
+import time
+from pathlib import Path
+
+from flask import jsonify
+
+from plugins.metadata.base import BaseMetadataProvider
+from utils.rclone_gdrive_copy import get_access_token
+
+from .drive_client import DriveAPIError, DriveClient
+from .store import open_store
+from .sync_worker import (
+    config_fingerprint,
+    poll_once,
+    preflight,
+    recover_on_start,
+    rewind_and_poll,
+    process_jobs,
+)
+
+
+logger = logging.getLogger(__name__)
+
+SELF_ID = "gdrive_reading_sync"
+ROUTE_BASE = f"/api/webhook/{SELF_ID}"
+
+
+class _DailyTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+    """**로컬** 자정마다 회전. 활성 파일명 `gdrive_reading_sync.log`,
+    회전본은 `gdrive_reading_sync_<YYYYMMDD>.log`.
+
+    로그를 읽는 사람은 서버 운영자다. 그 지역 시각으로 찍고 그 지역 자정에 회전한다.
+    그래야 `20260903.log` 안에 그 지역의 9월 3일 하루가 그대로 담긴다.
+
+    - subclass 의 rollover 가 기존 스트림을 닫고 다음 날짜의 `baseFilename`
+      을 다시 연다. `delay=True` 라서 init 시점이 아닌 첫 write 시점에 연다.
+    - 회전 직후 glob `gdrive_reading_sync_????????.log` 중 최신 `backupCount` 개만
+      남긴다 (날짜 없는 활성 파일, `.log.YYYY-MM-DD` 형태 만들지 않음).
+    - emit 도중 예외가 나면 console handler 가 남는 한 기록은 살아 있고, 이
+      handler 만 비활성화한다 (§3.3).
+    """
+
+    suffix_template = "%Y%m%d"
+
+    def __init__(self, base_filename: str, **kw) -> None:
+        # baseFilename 은 활성 파일 (날짜 접미사 없음). 회전 시 직접 닫고
+        # 자정 기준 YYYYMMDD 를 붙인 새 파일로 다시 연다.
+        super().__init__(filename=base_filename, **kw)
+        # namer/ rotator 기본값은 그대로 둔다 — 파일명만 우리가 덮어쓴다.
+
+    def rotation_filename(self, default_name: str) -> str:  # type: ignore[override]
+        # default_name = baseFilename + ".%Y-%m-%d" 같은 형태. 우리는 그걸 무시하고
+        # baseFilename 의 stem 에 YYYYMMDD 를 붙인다.
+        base = Path(self.baseFilename)
+        # 속성명은 rolloverAt (카멜케이스). rollover_at 으로 쓰면 회전 시 AttributeError 가
+        # 나고, emit 의 except 가 그것을 삼켜 handler 를 조용히 끈다 = 로그 사망.
+        # 2026-09-03 소킹에서 UTC 자정에 실제로 터졌다.
+        stamp = time.strftime(self.suffix_template, time.localtime(self.rolloverAt))
+        return str(base.with_name(f"{base.stem}_{stamp}.log"))
+
+    def getFilesToDelete(self):  # type: ignore[override]
+        # 우리 패턴: gdrive_reading_sync_????????.log
+        dir_name, _base = _split_base(self.baseFilename)
+        pattern = str(Path(dir_name) / f"{Path(self.baseFilename).stem}_????????.log")
+        files = sorted(_glob.glob(pattern))
+        if self.backupCount <= 0:
+            return []
+        return files[: -int(self.backupCount)]
+
+    def emit(self, record):  # type: ignore[override]
+        try:
+            super().emit(record)
+        except Exception:
+            self._disable_quietly()
+
+    def handleError(self, record):  # type: ignore[override]
+        # §3.3 — file handler 의 emit 실패가 stderr 에 traceback 을 dump 하지 않도록
+        # mute 한다. console handler 가 같은 record 를 들고 있어 거기에는 남는다.
+        self._disable_quietly()
+
+    def _disable_quietly(self):
+        try:
+            self.disabled = True
+        except Exception:
+            pass
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _split_base(base_filename: str) -> tuple[str, str]:
+    return (str(Path(base_filename).parent), Path(base_filename).name)
+
+_SERVICE_STARTED = False
+_SERVICE_LOCK = threading.Lock()
+_REGISTERED_APPS: set[int] = set()
+_ROUTES_LOCK = threading.Lock()
+
+
+class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
+    id = "gdrive_reading_sync"
+    name = "구드 독서 동기화"
+    is_searchable = False
+    category_tab = {
+        "title": "구드 동기화",
+        "icon": "fa-solid fa-cloud-arrow-down",
+        "order": 85,
+        "sessions": ["general"],
+    }
+    # 자동 업데이트 (guide_plugins.md §3 "플러그인 내부 업데이트 계약").
+    # raw_base_url 은 저장소 루트다 — 이 저장소는 루트가 곧 플러그인 폴더이며
+    # 설치 시 통째로 plugins/metadata/gdrive_reading_sync/ 로 복사한다.
+    #
+    # files 에 런타임 파일을 "전부" 나열해야 한다. 문서 예시는 모듈/__init__/VERSION
+    # 세 개뿐이지만, 그대로 두면 gdrive_reading_sync.py 만 새 버전이 되고
+    # sync_worker.py·store.py 는 옛 버전으로 남아 확실히 깨진다.
+    update_manifest = {
+        "enabled": True,
+        "provider": "github-raw",
+        "raw_base_url": (
+            "https://raw.githubusercontent.com/"
+            "scoop99/bookoasis-gdrive-reading-sync/main"
+        ),
+        "files": [
+            "gdrive_reading_sync.py",
+            "sync_worker.py",
+            "store.py",
+            "drive_client.py",
+            "__init__.py",
+            "index.html",
+            "script.js",
+            "style.css",
+            "settings.html",
+            "settings.js",
+            "settings.css",
+            "VERSION",
+        ],
+        "version_file": "VERSION",
+        "version_key": "plugin version",
+        "show_sample_update_button": True,
+    }
+    # copy-on-write 용 베이스. _refresh_remote_options() 가 새 list 를 만들어 대입한다.
+    _BASE_CONFIG_SCHEMA = [
+        {"key": "ENABLE_SYNC", "label": "동기화 활성화", "type": "checkbox", "default": False},
+        {"key": "DRY_RUN", "label": "dry_run — 감지만, 복사 안 함 (안전 게이트)", "type": "checkbox", "default": True},
+        {"key": "RCLONE_BIN", "label": "rclone 실행 파일", "type": "text", "default": "",
+         "description": "비우면 PATH에서 찾아 사용합니다. 설정 화면의 실행 확인으로 경로와 버전을 검사할 수 있습니다."},
+        # §10 (S8) — RCLONE_CONFIG: 비우면 기존 BookOasis env / 도커 번들 / ~/.config
+        # 폴백을 그대로 쓴다. 명시 경로가 정본이면 그 파일을 사용, 부재 시 preflight 실패.
+        {"key": "RCLONE_CONFIG", "label": "rclone 설정 파일 경로", "type": "text", "default": "",
+         "description": "비우면 BookOasis 기본 설정을 사용합니다. 확인하면 Drive 리모트 목록도 갱신됩니다."},
+        {"key": "TRANSFER_REMOTE", "label": "전송 rclone 리모트", "type": "select",
+         "options": [], "default": ""},
+        {"key": "DETECT_REMOTE", "label": "감지용 rclone 리모트", "type": "select",
+         "options": [], "default": ""},
+        {"key": "REMOTE_KIND", "label": "원격 연결 방식", "type": "select",
+         "options": [{"value": "auto", "label": "자동 판별"},
+                     {"value": "gds", "label": "GDS 경로 방식"},
+                     {"value": "folder_id", "label": "Google Drive 폴더 ID 방식"}],
+         "default": "auto",
+         "description": "자동 판별은 리모트 레코드에 GDS 접속 정보가 있으면 GDS, 없으면 폴더 ID 방식을 사용합니다."},
+        {"key": "REMOTE_ROOT_PATH", "label": "원격 루트 경로", "type": "text", "default": "",
+         "description": "GDS 경로 방식에서 리모트 이름 뒤에 붙는 기준 경로입니다."},
+        {"key": "REMOTE_ROOT_FOLDER_ID", "label": "원격 루트 폴더 ID", "type": "text", "default": "",
+         "description": "폴더 ID 방식에서 동기화 범위를 제한할 Google Drive 폴더 ID입니다."},
+        {"key": "LOCAL_ROOT", "label": "로컬 루트", "type": "text", "default": ""},
+        # §3 (S1) — TMP_ROOT 비우면 same-volume 폴백 (LOCAL_ROOT.parent / _reading_sync_tmp)
+        {"key": "TMP_ROOT", "label": "임시 폴더", "type": "text", "default": "",
+         "description": "전송 중 .part 파일을 저장합니다. 비우면 로컬 루트 상위의 _reading_sync_tmp를 사용합니다."},
+        {"key": "EXCLUDED_TOP", "label": "제외 최상위 (콤마)", "type": "text", "default": ""},
+        {"key": "EXTENSIONS", "label": "허용 확장자 (콤마)", "type": "text", "default": ".zip,.cbz,.epub,.pdf,.txt,.yaml,.xml,.json"},
+        {"key": "POLL_SECONDS", "label": "폴링 주기(초)", "type": "number", "default": 60},
+        {"key": "MAX_ATTEMPTS", "label": "시도 횟수 상한", "type": "number", "default": 3},
+        {"key": "RCLONE_TIMEOUT", "label": "rclone 명령 타임아웃(초)", "type": "number", "default": 1800},
+        {"key": "JOBS_PER_CYCLE", "label": "사이클당 claim 상한", "type": "number", "default": 20},
+        # §8 (S6) — 보존기간 + 자동 정리
+        {"key": "RETENTION_DAYS", "label": "종결 이력 보존 기간 (일)", "type": "number", "default": 30},
+        {"key": "AUTO_CLEANUP", "label": "종결 이력 자동 정리", "type": "checkbox", "default": True,
+         "description": "한 시간마다 확인해 보존 기간이 지난 완료·건너뜀·실패 이력만 삭제합니다. 실제 파일과 진행 중 작업은 삭제하지 않습니다."},
+        # 3라운드-B T1 — 날짜별 로그. 기본값은 의도적으로 빈 문자열.
+        # 비우면 plugin data 디렉터리(state.db 가 있는 곳) 아래 logs/ 로 폴백한다.
+        # 특정 환경의 드라이브 문자나 개인 폴더명을 기본값으로 두지 않는다 (공개 저장소).
+        {"key": "LOG_DIR", "label": "로그 디렉터리 (비우면 플러그인 데이터 아래 logs/)", "type": "text", "default": ""},
+        {"key": "LOG_RETENTION_DAYS", "label": "로그 파일 보존 기간 (일)", "type": "number", "default": 14},
+        # 3라운드-B T2 — 병렬 전송 (복사 job 만). 기본 5, 1..32 clamp. =1 이면
+        # 기존 단일 스레드와 100% 같은 코드 경로를 탄다 (§4.1 / 합격선 P1).
+        {"key": "PARALLEL_TRANSFERS", "label": "병렬 전송 동시 실행 수 (1이면 직렬)", "type": "number", "default": 5},
+    ]
+    config_schema: list = _BASE_CONFIG_SCHEMA
+    _last_cleanup_monotonic: float = 0.0  # §8.2 — 자동 정리 1시간 gate
+    # 3라운드-B T1 — runtime logger 캐시. fingerprint 가 바뀔 때만 handler 를 갈아끼운다.
+    _runtime_logger = None  # type: ignore[assignment]
+    _runtime_logger_fp: tuple = ()
+    _runtime_logger_lock = threading.Lock()
+
+    # ---- search/apply stub (BaseMetadataProvider 계약을 위한 최소 구현) ----
+    def search(self, db_type, query):
+        return []
+
+    def apply(self, db_type, book_id, item_data):
+        return False, "이 플러그인은 메타데이터 적용을 지원하지 않습니다."
+
+    # ---- config helpers ----
+    def _cfg(self, db_type: str) -> dict:
+        cfg = self.get_plugin_config(db_type, default={}) or {}
+        # 스키마 default 병합
+        merged: dict = {}
+        for entry in self.config_schema:
+            key = entry.get("key")
+            if key:
+                merged.setdefault(key, entry.get("default"))
+        for k, v in cfg.items():
+            if k in merged:
+                merged[k] = v
+        return merged
+
+    # §4.1 — 동적 options 갱신. 클래스 속성 config_schema 를 통째로 교체한다.
+    def _refresh_remote_options(self, cfg: dict) -> dict:
+        from .sync_worker import _rclone_config_dump, _resolve_rclone_bin, _rclone_config_args
+        bin_path = _resolve_rclone_bin(cfg)
+        try:
+            # §10 — RCLONE_CONFIG 정본 경로 또는 폴백. 부재 경로 시 아래 except 에서 잡힘.
+            dump = _rclone_config_dump(bin_path, cfg)
+            names = sorted(
+                n for n, rec in (dump or {}).items()
+                if isinstance(rec, dict) and rec.get("type") == "drive"
+            )
+            error = ""
+        except FileNotFoundError as exc:
+            # §10 — 명시 RCLONE_CONFIG 가 부재. 설정 화면엔 빈 remotes + 오류만 노출.
+            names = []
+            error = str(exc)
+        except Exception as exc:
+            # 폴백은 현재 설정값만. 특정 리모트 이름을 코드에 박지 않는다.
+            names = sorted({
+                (cfg.get("TRANSFER_REMOTE") or "").strip(),
+                (cfg.get("DETECT_REMOTE") or "").strip(),
+            } - {""})
+            error = str(exc)
+        opts = [{"value": n, "label": n} for n in names]
+        new_schema = []
+        for entry in self._BASE_CONFIG_SCHEMA:
+            if entry.get("key") in ("TRANSFER_REMOTE", "DETECT_REMOTE"):
+                clone = dict(entry)
+                clone["options"] = opts
+                new_schema.append(clone)
+            else:
+                new_schema.append(entry)
+        # copy-on-write — 부분 수정된 schema 를 다른 thread 가 보지 않게 한다.
+        self.config_schema = new_schema
+        return {"remotes": names, "error": error}
+
+    def _cleanup_if_due(
+        self,
+        store,
+        cfg: dict,
+        now_monotonic: float | None = None,
+        *,
+        log=print,
+    ) -> int:
+        """§8.2 — 자동 정리 1시간 due. AUTO_CLEANUP=true 일 때만 동작.
+
+        monotonic 1시간 gate. _WRITER_LOCK 안에서 짧게 DELETE.
+        """
+        import time as _t
+        if not self._is_truthy(cfg.get("AUTO_CLEANUP", True)):
+            return 0
+        now_m = now_monotonic if now_monotonic is not None else _t.monotonic()
+        if now_m - float(self._last_cleanup_monotonic or 0.0) < 3600.0:
+            return 0
+        rd = self._retention_days(cfg)
+        try:
+            deleted = store.cleanup_terminal(retention_days=rd)
+        except Exception as exc:
+            log(f"[{SELF_ID}] cleanup failed: {exc}")
+            store.set_state(status="error", error=f"cleanup: {exc}", last_poll_at=_iso_now())
+            return 0
+        self._last_cleanup_monotonic = now_m
+        if deleted:
+            log(f"[{SELF_ID}] cleanup: {deleted} terminal job(s) deleted (retention={rd})")
+        return deleted
+
+    @staticmethod
+    def _is_truthy(val) -> bool:
+        if isinstance(val, str):
+            return val.strip().lower() in ("true", "1", "yes", "on")
+        if val is None:
+            return False
+        return bool(val)
+
+    @staticmethod
+    def _retention_days(cfg: dict) -> int:
+        try:
+            v = int(cfg.get("RETENTION_DAYS", 30))
+        except Exception:
+            v = 30
+        return max(1, min(v, 3650))
+
+    # ---- 3라운드-B T1 — 날짜별 로그 -----------------------------------
+    @staticmethod
+    def _log_retention_days(cfg: dict) -> int:
+        """§3.2 — LOG_RETENTION_DAYS 정규화. 비수치 14, 1..3650 clamp."""
+        try:
+            v = int(cfg.get("LOG_RETENTION_DAYS", 14))
+        except Exception:
+            v = 14
+        return max(1, min(v, 3650))
+
+    @staticmethod
+    def _resolve_log_dir(cfg: dict, data_dir: Path) -> Path:
+        """§3.1 — LOG_DIR 정규화.
+
+        - 공백이면 `data_dir/logs` (플러그인 데이터 디렉터리, state.db 옆).
+        - 명시값은 `Path(value).expanduser().absolute()` — `resolve()` 금지 규약 준수.
+        - 절대 경로 비교만 한다 (resolve() 안 함).
+        """
+        raw = (cfg.get("LOG_DIR") or "")
+        if isinstance(raw, str):
+            raw = raw.strip()
+        if not raw:
+            return Path(data_dir) / "logs"
+        return Path(raw).expanduser().absolute()
+
+    def _configure_runtime_logger(self, cfg: dict, data_dir: Path):
+        """§3 — runtime logger 한 번 구성 (fingerprint 가 같으면 그대로).
+
+        - 항상 console StreamHandler 를 먼저 등록한다.
+        - 파일 handler 는 mkdir/FileHandler 생성 실패 시 console 로 경고만 남기고
+          console 만으로 진행한다.
+        - fingerprint (정규화 LOG_DIR, LOG_RETENTION_DAYS) 가 바뀌면 handler 를
+          닫고 새로 만든다.
+        """
+        retention = self._log_retention_days(cfg)
+        log_dir = self._resolve_log_dir(cfg, data_dir)
+        fp = (str(log_dir), int(retention))
+        with self._runtime_logger_lock:
+            existing = self._runtime_logger
+            if existing is not None and self._runtime_logger_fp == fp:
+                return existing
+            # 새 구성 — 기존 handler 모두 닫고 logger 자체도 새로.
+            if existing is not None:
+                for h in list(existing.handlers):
+                    try:
+                        h.close()
+                    except Exception:
+                        pass
+            logger = logging.getLogger("gdrive_reading_sync.runtime")
+            logger.setLevel(logging.INFO)
+            logger.propagate = False
+            # console — 항상 1개만.
+            for h in list(logger.handlers):
+                try:
+                    h.close()
+                except Exception:
+                    pass
+            # 로그는 서버를 운영하는 사람이 읽는다. **로컬 시각 + UTC 오프셋**으로 찍는다.
+            #   2026-09-03T13:48:06+0900
+            # 읽는 사람이 암산할 필요가 없고, 오프셋이 붙어 모호하지도 않다.
+            # 회전도 로컬 자정 기준이라, 20260903.log 는 그 지역의 9월 3일 하루가 담긴다.
+            #
+            # converter 는 **Formatter** 의 속성이다. Handler 에 붙이면 아무 효과가 없다
+            # (2026-09-03 소킹에서 실측된 결함 — 로컬 시각에 'Z' 만 붙어 UTC 인 척했다).
+            def _log_formatter():
+                f = logging.Formatter(
+                    fmt="%(asctime)s %(levelname)s %(threadName)s %(message)s",
+                    datefmt="%Y-%m-%dT%H:%M:%S%z",
+                )
+                f.converter = time.localtime
+                return f
+
+            sh = logging.StreamHandler(sys.stdout)
+            sh.setFormatter(_log_formatter())
+            logger.addHandler(sh)
+            # 파일 — 실패해도 worker 죽이면 안 됨.
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+                base = log_dir / "gdrive_reading_sync.log"
+                fh = _DailyTimedRotatingFileHandler(
+                    base_filename=str(base),
+                    when="midnight",
+                    interval=1,
+                    backupCount=retention,
+                    encoding="utf-8",
+                    delay=True,
+                    utc=False,   # 로컬 자정 회전 — 파일명 날짜와 내용이 같은 하루
+                )
+                fh.setFormatter(_log_formatter())
+                logger.addHandler(fh)
+            except Exception as exc:
+                # console 폴백 — 절대 worker 를 죽이면 안 됨 (T1 요구 §3.3)
+                logger.warning(
+                    "log file handler disabled: dir=%s err=%s: %s",
+                    str(log_dir), type(exc).__name__, exc,
+                )
+            self._runtime_logger = logger
+            self._runtime_logger_fp = fp
+            return logger
+
+    def _run_preflight(self, cfg: dict) -> dict:
+        # §4.4 — preflight 자체가 options 갱신을 겸한다.
+        out = self._refresh_remote_options(cfg)
+        options_info = out
+        pre = preflight(cfg)
+        if pre.get("success"):
+            pre["remotes"] = options_info.get("remotes")
+            self._last_preflight_fp = config_fingerprint(cfg, pre)
+        else:
+            pre["remotes"] = options_info.get("remotes")
+            self._last_preflight_fp = None
+        return pre
+
+    _last_preflight_fp = None  # 클래스 레벨 캐시 (프로세스 수명)
+
+    def _is_enabled(self, db_type: str) -> bool:
+        val = self._cfg(db_type).get("ENABLE_SYNC", False)
+        # ponytail: bool("false") == True 인 함정 회피. 문자열은 명시 화이트리스트,
+        # 그 외는 None 가드 후 bool() 사용.
+        if isinstance(val, str):
+            return val.strip().lower() in ("true", "1", "yes", "on")
+        if val is None:
+            return False
+        return bool(val)
+
+    def _poll_seconds(self, db_type: str) -> float:
+        try:
+            v = float(self._cfg(db_type).get("POLL_SECONDS", 60))
+        except Exception:
+            v = 60.0
+        return max(5.0, min(3600.0, v))
+
+    # ---- background service ----
+    def start_background_service(self, db_type: str):
+        global _SERVICE_STARTED
+        with _SERVICE_LOCK:
+            if _SERVICE_STARTED:
+                return None
+            _SERVICE_STARTED = True
+
+        try:
+            self._ensure_routes()
+        except Exception as exc:
+            logger.error(f"[{SELF_ID}] ensure_routes failed: {exc}")
+
+        thread = threading.Thread(target=self._run_loop, name="gdrive-reading-sync", daemon=True)
+        thread.start()
+        return None
+
+    def _run_loop(self):
+        store = open_store(__file__)
+        cfg0 = self._cfg("general")
+        # 3라운드-B T1 — §3.1. plugin data 디렉터리 = state.db 가 있는 곳. LOG_DIR
+        # 공백이면 그 아래 logs/ 로 폴백한다. logger 는 fingerprint (정규화 LOG_DIR,
+        # LOG_RETENTION_DAYS) 가 바뀌면 cycle 사이에서만 재구성한다.
+        runtime_logger = self._configure_runtime_logger(cfg0, store.db_path.parent)
+        log = runtime_logger.info
+        log_exc = runtime_logger.exception
+        # startup — §9.3 / §4.1 / 리뷰 r2 F2. 실패도 sync_state 에 남긴다.
+        # dry_run → queued 승격은 Store.__init__ 마다 도는 부작용이 있어
+        # 명시적 1회성 호출로 격리했다.
+        try:
+            promoted = store.promote_dry_run_to_queued()
+            log(f"[{SELF_ID}] promote_dry_run_to_queued: {promoted} promoted")
+        except Exception as exc:
+            log(f"[{SELF_ID}] promote_dry_run_to_queued failed: {exc}")
+        try:
+            rec = recover_on_start(store, cfg0, log=log)
+            log(f"[{SELF_ID}] recover_on_start: {rec.get('recovered')} recovered, "
+                f"tmp_cleanup={len(rec.get('tmp_cleanup') or [])}")
+        except Exception as exc:
+            log_exc(f"[{SELF_ID}] recover_on_start failed")
+            store.set_state(status="error", error=f"recover: {exc}", last_poll_at=_iso_now())
+        try:
+            self._refresh_remote_options(cfg0)
+        except Exception as exc:
+            log(f"[{SELF_ID}] refresh_remote_options failed: {exc}")
+
+        sleep_s = self._poll_seconds("general")
+        while True:
+            try:
+                # §8.2 — 1시간 gate 자동 정리 (AUTO_CLEANUP on 일 때만).
+                self._cleanup_if_due(store, self._cfg("general"), log=log)
+                if self._is_enabled("general"):
+                    cfg = self._cfg("general")
+                    # §3.1 — fingerprint 변경 시 logger 재구성.
+                    runtime_logger = self._configure_runtime_logger(
+                        cfg, store.db_path.parent
+                    )
+                    log = runtime_logger.info
+                    log_exc = runtime_logger.exception
+                    dry_run = cfg.get("DRY_RUN", True)
+                    # === 감지 (D6 분리) — 토큰/Drive 실패는 job claim 을 막지 않는다
+                    try:
+                        token = get_access_token(cfg.get("DETECT_REMOTE", ""))
+                        client = DriveClient(token)
+                        poll_once(client, store, cfg, log=log)
+                    except Exception as exc:
+                        store.set_state(status="error", error=f"detect: {exc}",
+                                        last_poll_at=_iso_now())
+                        log(f"[{SELF_ID}] detect failed: {exc}")
+                    # === 복사 (D6 분리) — preflight 성공 + dry_run off 일 때만
+                    if not dry_run:
+                        try:
+                            fp = config_fingerprint(cfg, {
+                                "rclone_resolved": "",
+                                "transfer_remote": cfg.get("TRANSFER_REMOTE", ""),
+                                "remote_kind": "",
+                                "remotes": [],
+                                "probe": {},
+                            })
+                            cur_fp = self._last_preflight_fp
+                            need_preflight = (
+                                cur_fp is None
+                                or fp[:3] != (cur_fp[0], cur_fp[1], cur_fp[2])
+                                or fp[3] != cur_fp[3]
+                                or fp[4] != cur_fp[4]
+                            )
+                            if need_preflight:
+                                pre = self._run_preflight(cfg)
+                                if not pre.get("success"):
+                                    log(f"[{SELF_ID}] preflight failed: {pre.get('error')}")
+                            if self._last_preflight_fp is not None:
+                                out = process_jobs(store, cfg, log=log)
+                                if out.get("claimed"):
+                                    log(f"[{SELF_ID}] process_jobs: {out}")
+                        except Exception as exc:
+                            log_exc(f"[{SELF_ID}] copy phase failed")
+                            store.set_state(status="error", error=f"copy: {exc}",
+                                            last_poll_at=_iso_now())
+                else:
+                    # 비활성: 호출 없이 sleep만
+                    time.sleep(sleep_s)
+                    continue
+            except Exception as exc:
+                log_exc(f"[{SELF_ID}] loop error")
+                try:
+                    store.set_state(status="error", error=str(exc), last_poll_at=_iso_now())
+                except Exception:
+                    pass
+            time.sleep(sleep_s)
+
+    # ---- routes (gamebooks 패턴 차용) ----
+    def _ensure_routes(self):
+        # ponytail: 부팅 훅이 없는 환경에선 current_app 컨텍스트가 없을 수 있다.
+        # 그때는 core.app 을 직접 끌어와 라우트를 붙인다. 1) current_app 우선, 2) core.app 폴백.
+        app = None
+        try:
+            from flask import current_app
+            app = current_app._get_current_object()
+        except Exception:
+            app = None
+        if app is None:
+            try:
+                from core import app as core_app  # type: ignore
+                app = core_app
+            except Exception as exc:
+                logger.error(f"[{SELF_ID}] ensure_routes: core.app not importable: {exc}")
+                return
+        try:
+            self._do_register_routes(app)
+        except Exception as exc:
+            logger.error(f"[{SELF_ID}] ensure_routes error: {exc}")
+
+    def _do_register_routes(self, app):
+        with _ROUTES_LOCK:
+            app_id = id(app)
+            if app_id in _REGISTERED_APPS:
+                return
+            try:
+                from werkzeug.routing import Rule
+                routes = {
+                    "gdrs_status": (f"{ROUTE_BASE}/status", ["GET"]),
+                    "gdrs_jobs": (f"{ROUTE_BASE}/jobs", ["GET"]),
+                    "gdrs_backfill": (f"{ROUTE_BASE}/backfill", ["POST"]),
+                    "gdrs_preflight": (f"{ROUTE_BASE}/preflight", ["GET"]),
+                    "gdrs_rclone_check": (f"{ROUTE_BASE}/rclone-check", ["POST"]),
+                    # §7 (S5) — 일괄 재시도
+                    "gdrs_retry": (f"{ROUTE_BASE}/retry", ["POST"]),
+                    # §8 (S6) — 보존기간/정리
+                    "gdrs_cleanup": (f"{ROUTE_BASE}/cleanup", ["POST"]),
+                }
+                registered = set(rule.endpoint for rule in app.url_map.iter_rules())
+                for endpoint, (path, methods) in routes.items():
+                    handler = f"_route_{endpoint.replace('gdrs_', '')}"
+                    view_func = getattr(self, handler, None)
+                    if view_func:
+                        app.view_functions[endpoint] = view_func
+                        if endpoint not in registered:
+                            app.url_map.add(Rule(path, endpoint=endpoint, methods=methods))
+
+                if not getattr(app, "_gdrs_wsgi_patched", False):
+                    orig_wsgi = app.wsgi_app
+
+                    def _gdrs_wsgi(environ, start_response):
+                        path = environ.get("PATH_INFO", "")
+                        if path.startswith(ROUTE_BASE):
+                            try:
+                                self._do_register_routes(app)
+                            except Exception:
+                                pass
+                        return orig_wsgi(environ, start_response)
+
+                    app.wsgi_app = _gdrs_wsgi
+                    app._gdrs_wsgi_patched = True
+
+                _REGISTERED_APPS.add(app_id)
+            except Exception as exc:
+                logger.error(f"[{SELF_ID}] route register error: {exc}")
+
+    # ---- HTTP handlers ----
+    def _route_status(self):
+        store = open_store(__file__)
+        return jsonify(store.read_status())
+
+    def _route_jobs(self):
+        from flask import request
+        store = open_store(__file__)
+        # §6.3 — page_size/limit 동시: page_size 우선. limit 만: 옛 의미 (첫 limit 행).
+        # 둘 다 없음: page=1, page_size=50.
+        page_size_raw = request.args.get("page_size")
+        limit_raw = request.args.get("limit", default=None, type=int)
+        if page_size_raw is not None:
+            try:
+                page_size = int(page_size_raw)
+            except (TypeError, ValueError):
+                page_size = 50
+            resp = store.list_page(
+                page=request.args.get("page", default=1, type=int),
+                page_size=page_size,
+                status=request.args.get("status", default=""),
+                action=request.args.get("action", default=""),
+                result=request.args.get("result", default=""),
+                search=request.args.get("search", default=""),
+                order=request.args.get("order", default="desc"),
+            )
+        elif limit_raw is not None:
+            resp = store.read_jobs(limit=limit_raw)
+        else:
+            resp = store.list_page(
+                page=request.args.get("page", default=1, type=int),
+                page_size=50,
+                status=request.args.get("status", default=""),
+                action=request.args.get("action", default=""),
+                result=request.args.get("result", default=""),
+                search=request.args.get("search", default=""),
+                order=request.args.get("order", default="desc"),
+            )
+        return jsonify(resp)
+
+    # ponytail: Drive 쓰기 0 — changes GET 만. 강제 1회 재생.
+    # Drive change 토큰은 계정 단위로 1씩 증가하는 정수라 빼면 과거로 되감긴다.
+    # ?back=N  → 현재 startPageToken - N 부터 재생 (기본 1000 ≈ 2~3일).
+    # 이게 "파일이 바뀌기를 기다리지 않고" 감지 파이프를 검증하는 유일한 수단이다.
+    def _route_backfill(self):
+        from flask import request
+        cfg = self._cfg("general")
+        if not self._is_enabled("general"):
+            return jsonify({"success": False, "error": "ENABLE_SYNC 꺼져 있음"}), 400
+        try:
+            token = get_access_token(cfg.get("DETECT_REMOTE", ""))
+        except Exception as exc:
+            return jsonify({"success": False, "error": f"token: {exc}"}), 500
+        client = DriveClient(token)
+        store = open_store(__file__)
+        try:
+            back = int(request.args.get("back", 1000))
+        except (TypeError, ValueError):
+            back = 1000
+        back = max(0, min(back, 200000))
+        try:
+            out = rewind_and_poll(client, store, cfg, back, log=print)
+        except DriveAPIError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 500
+        except Exception as exc:
+            return jsonify({"success": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+        return jsonify({"success": True, **out})
+
+    def _route_retry(self):
+        """§7 (S5) — atomic terminal-only 재시도.
+
+        body: {"job_ids":[12,13]} 또는 {"failed_all":true}.
+        """
+        from flask import request
+        store = open_store(__file__)
+        try:
+            payload = request.get_json(force=True, silent=False) or {}
+        except Exception:
+            return jsonify({"success": False, "error": "json_body_required"}), 400
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "json_object_required"}), 400
+        if "job_ids" in payload:
+            ids = payload.get("job_ids") or []
+            if not isinstance(ids, list):
+                return jsonify({"success": False, "error": "job_ids_list_required"}), 400
+            out = store.retry_jobs([int(x) for x in ids])
+            if out["retried"] != len(ids):
+                return jsonify({
+                    "success": False, "error": "jobs_not_retryable", **out,
+                }), 409
+            return jsonify({"success": True, **out})
+        if payload.get("failed_all") is True:
+            out = store.retry_jobs(failed_all=True)
+            return jsonify({"success": True, **out})
+        return jsonify({"success": False, "error": "job_ids_or_failed_all_required"}), 400
+
+    def _route_cleanup(self):
+        """§8 (S6) — 수동 cleanup. body: {"delete_all": false} 또는 true."""
+        from flask import request
+        store = open_store(__file__)
+        try:
+            payload = request.get_json(force=True, silent=True) or {}
+        except Exception:
+            payload = {}
+        cfg = self._cfg("general")
+        delete_all = bool(payload.get("delete_all"))
+        rd = self._retention_days(cfg)
+        try:
+            deleted = store.cleanup_terminal(retention_days=rd, delete_all=delete_all)
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)}), 500
+        return jsonify({
+            "success": True, "deleted": deleted,
+            "delete_all": delete_all, "retention_days": rd,
+        })
+
+    def _route_preflight(self):
+        # §4.4 — Drive / 로컬에 쓰지 않는다. 실제 실행된 rclone 경로/버전과 probe 만.
+        cfg = self._cfg("general")
+        try:
+            out = self._run_preflight(cfg)
+        except Exception as exc:
+            return jsonify({"success": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+        # 인증값/시크릿 노출 방지 — 응답은 whitelist 키만.
+        safe = {
+            "success": bool(out.get("success")),
+            "error": out.get("error", "") or "",
+            "rclone_bin": out.get("rclone_bin", "") or "",
+            "rclone_resolved": out.get("rclone_resolved", "") or "",
+            "rclone_version": out.get("rclone_version", "") or "",
+            "config_file": out.get("config_file", "") or "",
+            "remotes": out.get("remotes", []) or [],
+            "transfer_remote": out.get("transfer_remote", "") or "",
+            "remote_kind": out.get("remote_kind", "") or "",
+            "probe": out.get("probe", {}) or {},
+        }
+        return jsonify(safe)
+
+    def _route_rclone_check(self):
+        """설정 화면용 읽기 전용 검사.
+
+        아직 저장하지 않은 RCLONE_BIN/RCLONE_CONFIG 값을 받아 실행 파일의 버전과
+        설정 파일의 Drive 리모트 목록을 확인한다. rclone 쓰기 명령은 호출하지 않는다.
+        """
+        from flask import request
+        from .sync_worker import inspect_rclone_setup
+
+        try:
+            payload = request.get_json(force=True, silent=False) or {}
+        except Exception:
+            return jsonify({"success": False, "error": "JSON 요청이 필요합니다."}), 400
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "JSON 객체가 필요합니다."}), 400
+
+        mode = str(payload.get("mode") or "binary").strip().lower()
+        if mode not in ("binary", "config"):
+            return jsonify({"success": False, "error": "지원하지 않는 확인 유형입니다."}), 400
+
+        cfg = self._cfg("general")
+        for key, limit in (("RCLONE_BIN", 1024), ("RCLONE_CONFIG", 2048)):
+            if key.lower() in payload:
+                value = str(payload.get(key.lower()) or "").strip()
+                if len(value) > limit:
+                    return jsonify({"success": False, "error": f"{key} 값이 너무 깁니다."}), 400
+                cfg[key] = value
+
+        out = inspect_rclone_setup(cfg, include_config=(mode == "config"))
+        # config dump 원문에는 인증 정보가 있으므로 절대로 응답하지 않는다.
+        safe = {
+            "success": bool(out.get("success")),
+            "error": out.get("error", "") or "",
+            "rclone_resolved": out.get("rclone_resolved", "") or "",
+            "rclone_version": out.get("rclone_version", "") or "",
+            "config_file": out.get("config_file", "") or "",
+            "remotes": out.get("remotes", []) or [],
+        }
+        return jsonify(safe), (200 if safe["success"] else 400)
+
+
+def _iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
