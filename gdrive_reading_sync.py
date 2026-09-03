@@ -134,7 +134,7 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
         "provider": "github-raw",
         "raw_base_url": (
             "https://raw.githubusercontent.com/"
-            "scoop99/bookoasis-gdrive-reading-sync/main"
+            "scoop99/gdrive_reading_sync/main"
         ),
         "files": [
             "gdrive_reading_sync.py",
