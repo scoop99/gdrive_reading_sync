@@ -123,14 +123,20 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
         "sessions": ["general"],
     }
     # 자동 업데이트 (guide_plugins.md §3 "플러그인 내부 업데이트 계약").
-    # raw_base_url 은 저장소 루트다 — 이 저장소는 루트가 곧 플러그인 폴더이며
-    # 설치 시 통째로 plugins/metadata/gdrive_reading_sync/ 로 복사한다.
+    #
+    # **현재 꺼져 있다.** 저장소가 비공개라 raw.githubusercontent.com 이 404 를
+    # 돌려준다. 코어의 업데이트 경로(services/plugin_service.py)는 인증 헤더를
+    # 쓰지 않고 raw URL 에 그냥 GET 하므로 비공개 저장소에서는 동작할 수 없다.
+    # 갱신은 파일을 직접 복사한다.
+    #
+    # 저장소를 공개로 되돌리면 enabled/show_sample_update_button 을 True 로
+    # 바꾸면 그대로 동작한다. 나머지 값은 맞춰 둔 상태다.
     #
     # files 에 런타임 파일을 "전부" 나열해야 한다. 문서 예시는 모듈/__init__/VERSION
     # 세 개뿐이지만, 그대로 두면 gdrive_reading_sync.py 만 새 버전이 되고
     # sync_worker.py·store.py 는 옛 버전으로 남아 확실히 깨진다.
     update_manifest = {
-        "enabled": True,
+        "enabled": False,
         "provider": "github-raw",
         "raw_base_url": (
             "https://raw.githubusercontent.com/"
@@ -152,7 +158,7 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
         ],
         "version_file": "VERSION",
         "version_key": "plugin version",
-        "show_sample_update_button": True,
+        "show_sample_update_button": False,
     }
     # copy-on-write 용 베이스. _refresh_remote_options() 가 새 list 를 만들어 대입한다.
     _BASE_CONFIG_SCHEMA = [
