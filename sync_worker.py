@@ -285,6 +285,16 @@ def _poll_once_locked(client: DriveClient, store: Store, cfg: dict, log=print) -
     cache: dict[str, dict] = {}
     next_token = page_token
     pages = 0
+    # 한 사이클 페이지 상한. Drive changes.list 는 사용자당 요청 속도 제한이 있어
+    # 수백 페이지를 연속 호출하면 403 Forbidden(rate limit)이 난다.
+    # 2026-09-06 실측: 구드 쪽 대량 변경으로 pages=327/530/576 까지 치솟자
+    # 하루 61회 403. 상한을 두면 밀린 이력을 여러 사이클에 나눠 소화한다.
+    try:
+        max_pages = int(cfg.get("MAX_PAGES_PER_POLL") or 50)
+    except (TypeError, ValueError):
+        max_pages = 50
+    max_pages = max(1, min(max_pages, 500))
+    truncated = False
 
     try:
         while True:
@@ -425,6 +435,10 @@ def _poll_once_locked(client: DriveClient, store: Store, cfg: dict, log=print) -
             next_page = data.get("nextPageToken")
             if next_page:
                 next_token = next_page
+                # 상한에 닿으면 여기까지의 토큰을 커밋하고 다음 사이클로 넘긴다.
+                if pages >= max_pages:
+                    truncated = True
+                    break
                 continue
             new_token = data.get("newStartPageToken")
             if new_token:
@@ -433,12 +447,24 @@ def _poll_once_locked(client: DriveClient, store: Store, cfg: dict, log=print) -
 
         store.set_state(page_token=next_token, status="ready", error="", last_poll_at=_iso_now())
     except DriveAPIError as exc:
-        store.set_state(status="error", error=str(exc), last_poll_at=_iso_now())
-        log(f"[gdrive_reading_sync] poll error: {exc}")
+        # 진행분을 반드시 보존한다. 여기서 토큰을 버리면 다음 사이클이 같은 자리에서
+        # 다시 시작해 또 같은 지점에서 실패한다 — 영구 무한루프가 된다.
+        # 2026-09-06~07 실측: 403 이 하루 61회, page_token 이 7434511 에 고정된 채
+        # queued 가 102,719 건까지 쌓였다. nextPageToken 은 이어받기용으로 유효하므로
+        # 부분 저장이 안전하다.
+        if next_token and next_token != page_token:
+            store.set_state(page_token=next_token, status="error", error=str(exc),
+                            last_poll_at=_iso_now())
+            log(f"[gdrive_reading_sync] poll error: {exc} "
+                f"(진행분 {pages}페이지 보존, token={next_token})")
+        else:
+            store.set_state(status="error", error=str(exc), last_poll_at=_iso_now())
+            log(f"[gdrive_reading_sync] poll error: {exc} (진행분 없음)")
         summary["ok"] = False
         summary["error"] = str(exc)
 
     summary["pages"] = pages
+    summary["truncated"] = truncated
     summary["page_token"] = next_token
     # folders_seen / probe_skipped 를 반드시 함께 찍는다.
     # 이 둘이 빠져 있으면 changes_seen 이 어디로 갔는지 로그만으로 설명되지 않는다.

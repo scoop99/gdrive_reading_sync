@@ -194,6 +194,10 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
         {"key": "MAX_ATTEMPTS", "label": "시도 횟수 상한", "type": "number", "default": 3},
         {"key": "RCLONE_TIMEOUT", "label": "rclone 명령 타임아웃(초)", "type": "number", "default": 1800},
         {"key": "JOBS_PER_CYCLE", "label": "사이클당 claim 상한", "type": "number", "default": 20},
+        # Drive changes.list 는 사용자당 요청 속도 제한이 있다. 한 사이클에 수백 페이지를
+        # 연속 호출하면 403(rate limit)이 난다. 상한을 두면 밀린 이력을 여러 사이클에
+        # 나눠 소화한다. 1~500 범위로 정규화.
+        {"key": "MAX_PAGES_PER_POLL", "label": "사이클당 변경 페이지 상한", "type": "number", "default": 50},
         # §8 (S6) — 보존기간 + 자동 정리
         {"key": "RETENTION_DAYS", "label": "종결 이력 보존 기간 (일)", "type": "number", "default": 30},
         {"key": "AUTO_CLEANUP", "label": "종결 이력 자동 정리", "type": "checkbox", "default": True,
