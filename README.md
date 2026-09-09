@@ -183,6 +183,7 @@ rclone --config <conf경로> config reconnect myremote:
 | `EXTENSIONS` | 허용 확장자 (쉼표 구분) |
 | `POLL_SECONDS` | 폴링 주기 (기본 60초) |
 | `PARALLEL_TRANSFERS` | 병렬 전송 수 (기본 5, 1이면 직렬) |
+| `AUTO_SCAN` | 복사가 끝난 폴더를 품는 라이브러리를 자동으로 스캔 큐에 등록 (기본 켜짐) |
 | `JOBS_PER_CYCLE` | 사이클당 처리 상한 |
 | `MAX_ATTEMPTS` / `RCLONE_TIMEOUT` | 재시도 상한 / 명령 타임아웃 |
 | `RETENTION_DAYS` / `AUTO_CLEANUP` | 종결 이력 보존 일수 / 자동 정리 |

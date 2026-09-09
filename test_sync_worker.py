@@ -2674,6 +2674,103 @@ def test_T_P7_SYM_T2_PARALLEL_copy_concurrent_speedup():
 
 
 
+
+# ---- T3 자동 스캔 (복사 완료 -> 라이브러리 스캔 큐) ----------------------
+
+def test_T_AS1_pick_library_deepest_match():
+    """T-AS1 — 중첩 등록이면 가장 깊은 라이브러리가 이긴다. 밖이면 None."""
+    from plugins.metadata.gdrive_reading_sync.gdrive_reading_sync import _pick_library
+    root = Path(tempfile.mkdtemp())
+    libs = [
+        ("general", 1, str(root / "READING")),
+        ("general", 2, str(root / "READING" / "만화")),
+        ("adult", 3, str(root / "ADULT")),
+    ]
+    assert _pick_library(libs, str(root / "READING" / "만화" / "SPARK")) ==         ("general", 2, str(root / "READING" / "만화")), "가장 깊은 것"
+    assert _pick_library(libs, str(root / "READING" / "잡지")) ==         ("general", 1, str(root / "READING")), "부모만 있으면 부모"
+    assert _pick_library(libs, str(root / "READING2" / "x")) is None, "접두어만 같은 형제는 제외"
+    assert _pick_library(libs, str(root / "ELSE")) is None, "라이브러리 밖"
+    print("  OK T-AS1 라이브러리 매칭 (최심 우선 / 경계 / 밖=None)")
+
+
+def test_T_AS2_landed_dirs_only_for_real_disk_change():
+    """T-AS2 — completed 는 landed_dirs 에 들어가고 duplicate skip 은 안 들어간다."""
+    import hashlib as _hl
+    store = _store()
+    payload = b"AUTOSCAN_PAYLOAD"
+    md5 = _hl.md5(payload).hexdigest()
+    fake = _FakeRclone(fake_remote_bytes=payload)
+    cfg = dict(CFG, PARALLEL_TRANSFERS=1, LOCAL_ROOT=str(Path(tempfile.mkdtemp())),
+               JOBS_PER_CYCLE=5, MAX_ATTEMPTS=3)
+    target = Path(cfg["LOCAL_ROOT"]) / "만화" / "as.pdf"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _seed_job(store, action="create", remote_path="만화/as.pdf",
+              local_path=str(target), size=len(payload), md5=md5)
+    out = process_jobs(store, cfg, run_rclone=fake, log=lambda *a: None)
+    assert out["completed"] == 1, out
+    assert out["landed_dirs"] == [str(target.parent)], out["landed_dirs"]
+
+    # 같은 파일 재요청 = D1 duplicate skip -> 디스크 변화 없음
+    _seed_job(store, action="create", remote_path="만화/as.pdf",
+              local_path=str(target), size=len(payload), md5=md5,
+              event_key="ek:as:dup")
+    out2 = process_jobs(store, cfg, run_rclone=fake, log=lambda *a: None)
+    assert out2["skipped"] == 1, out2
+    assert out2["landed_dirs"] == [], out2["landed_dirs"]
+    print("  OK T-AS2 landed_dirs 는 실제 디스크 변화만 (duplicate 제외)")
+
+
+def test_T_AS3_auto_scan_enqueues_once_and_retries_on_reject():
+    """T-AS3 — 큐 등록 성공하면 비우고, 거부되면 남겨 다음 사이클에 재시도. off 면 무동작."""
+    import types as _t
+    from plugins.metadata.gdrive_reading_sync.gdrive_reading_sync import (
+        GdriveReadingSyncMetadataProvider as P,
+    )
+    root = Path(tempfile.mkdtemp())
+    lib_dir = root / "READING"
+    (lib_dir / "만화").mkdir(parents=True, exist_ok=True)
+
+    calls = []
+    accept = {"v": False}
+
+    def _enqueue(task_type, **kw):
+        calls.append((task_type, kw))
+        return accept["v"]
+
+    sys.modules["database"] = _t.ModuleType("database")
+    sys.modules["database"].get_db_path = lambda db_type="general": f"db:{db_type}"
+    sq = _t.ModuleType("services.scanner_queue")
+    sq.scanner_queue = _t.SimpleNamespace(enqueue=_enqueue)
+    sys.modules.setdefault("services", _t.ModuleType("services"))
+    sys.modules["services.scanner_queue"] = sq
+
+    p = P()
+    p._pending_scan_libs = set()
+    p._all_libraries = staticmethod(lambda log=print: [("general", 7, str(lib_dir))])
+
+    # off -> 아무 것도 하지 않는다
+    p._auto_scan({"AUTO_SCAN": False}, [str(lib_dir / "만화")], log=lambda *a: None)
+    assert calls == [], calls
+
+    # on + 큐 거부 -> 남는다
+    p._auto_scan({"AUTO_SCAN": True}, [str(lib_dir / "만화")], log=lambda *a: None)
+    assert len(calls) == 1, calls
+    assert calls[0][0] == "library_scan"
+    assert calls[0][1]["library_id"] == 7 and calls[0][1]["force"] is False, calls[0][1]
+    assert p._pending_scan_libs, "거부됐으니 남아 있어야 한다"
+
+    # 다음 사이클 (새 landed 없음) + 큐 수락 -> 비워진다
+    accept["v"] = True
+    p._auto_scan({"AUTO_SCAN": True}, [], log=lambda *a: None)
+    assert len(calls) == 2, calls
+    assert not p._pending_scan_libs, p._pending_scan_libs
+
+    # 더 이상 재시도 없음
+    p._auto_scan({"AUTO_SCAN": True}, [], log=lambda *a: None)
+    assert len(calls) == 2, calls
+    print("  OK T-AS3 자동 스캔 큐 등록 / 거부 재시도 / off 게이트")
+
+
 if __name__ == "__main__":
     tests = [
         # 기존 6종 (1라운드 회귀)
@@ -2761,6 +2858,10 @@ if __name__ == "__main__":
         test_T_P7_P5_executor_only_receives_copy_jobs,
         test_T_P7_P6_no_direct_writer_execute_in_sync_worker,
         test_T_P7_SYM_T2_PARALLEL_copy_concurrent_speedup,
+        # T3 — 자동 스캔 신규 3종
+        test_T_AS1_pick_library_deepest_match,
+        test_T_AS2_landed_dirs_only_for_real_disk_change,
+        test_T_AS3_auto_scan_enqueues_once_and_retries_on_reject,
     ]
     for fn in tests:
         fn()

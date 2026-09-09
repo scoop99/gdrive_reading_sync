@@ -11,6 +11,7 @@ from __future__ import annotations
 import glob as _glob
 import logging
 import logging.handlers
+import os
 import sys
 import threading
 import time
@@ -37,6 +38,30 @@ logger = logging.getLogger(__name__)
 
 SELF_ID = "gdrive_reading_sync"
 ROUTE_BASE = f"/api/webhook/{SELF_ID}"
+
+# 자동 스캔이 라이브러리를 찾을 세션 (local_folder_watch 샘플 플러그인과 동일)
+_WATCHED_SESSIONS = ("general", "adult", "audiobook", "video")
+
+
+def _pick_library(libraries: list, path: str):
+    """`path` 를 품는 가장 깊은 라이브러리를 고른다. 없으면 None.
+
+    libraries: `(session, library_id, physical_path)` 튜플 목록.
+    중첩 등록(부모/자식 둘 다 라이브러리)일 때 자식이 이긴다 — 그래야
+    새 파일이 실제로 보이는 라이브러리 하나만 스캔한다.
+    """
+    target = os.path.normcase(os.path.abspath(path))
+    best = None
+    best_len = -1
+    for session, library_id, physical_path in libraries:
+        root = str(physical_path or "").strip()
+        if not root:
+            continue
+        root_n = os.path.normcase(os.path.abspath(root))
+        if target == root_n or target.startswith(root_n + os.sep):
+            if len(root_n) > best_len:
+                best, best_len = (session, library_id, root), len(root_n)
+    return best
 
 
 class _DailyTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
@@ -215,6 +240,9 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
         # 3라운드-B T2 — 병렬 전송 (복사 job 만). 기본 5, 1..32 clamp. =1 이면
         # 기존 단일 스레드와 100% 같은 코드 경로를 탄다 (§4.1 / 합격선 P1).
         {"key": "PARALLEL_TRANSFERS", "label": "병렬 전송 동시 실행 수 (1이면 직렬)", "type": "number", "default": 5},
+        # 복사가 끝난 폴더를 품는 라이브러리만 증분 스캔(force=False)에 넣는다.
+        {"key": "AUTO_SCAN", "label": "복사 완료 후 자동 스캔", "type": "checkbox", "default": True,
+         "description": "파일이 로컬에 내려앉으면 그 폴더가 속한 BookOasis 라이브러리를 스캔 큐에 넣어 새 책을 자동 등록합니다. 증분 스캔이라 이미 등록된 책은 다시 읽지 않습니다."},
     ]
     # copy-on-write 기준. _refresh_remote_options() 가 이걸 원본 삼아
     # 새 list 를 만들어 self.config_schema 에 대입한다 (원본 불변).
@@ -554,6 +582,9 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
                                 out = process_jobs(store, cfg, log=log)
                                 if out.get("claimed"):
                                     log(f"[{SELF_ID}] process_jobs: {out}")
+                                self._auto_scan(
+                                    cfg, out.get("landed_dirs") or [], log=log
+                                )
                         except Exception as exc:
                             log_exc(f"[{SELF_ID}] copy phase failed")
                             store.set_state(status="error", error=f"copy: {exc}",
@@ -569,6 +600,76 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
                 except Exception:
                     pass
             time.sleep(sleep_s)
+
+    # ---- 자동 스캔 (복사 완료 -> BookOasis 라이브러리 스캔 큐) ----
+    # 큐가 중복을 거부하면(이미 pending/running) 여기 남겨 두고 다음 사이클에 재시도한다.
+    _pending_scan_libs: set = set()
+
+    def _auto_scan(self, cfg: dict, landed_dirs: list, log=print) -> None:
+        """복사가 끝난 폴더를 품는 라이브러리만 증분 스캔 큐에 넣는다.
+
+        `force=False` 라서 이미 등록된 책은 다시 읽지 않는다 — 새로 들어온 것만 추가된다.
+        폴더 감시(watchdog)를 두지 않는 이유: 파일이 언제 내려앉는지는 이 플러그인이
+        직접 알고 있어서 감시할 대상이 없다.
+        """
+        if not self._is_truthy(cfg.get("AUTO_SCAN", True)):
+            self._pending_scan_libs.clear()
+            return
+
+        if landed_dirs:
+            libraries = self._all_libraries(log=log)
+            for d in landed_dirs:
+                hit = _pick_library(libraries, d)
+                if hit is None:
+                    log(f"[{SELF_ID}] auto_scan: 라이브러리에 없는 경로라 건너뜀 — {d}")
+                    continue
+                self._pending_scan_libs.add(hit)
+
+        if not self._pending_scan_libs:
+            return
+        try:
+            import database
+            from services.scanner_queue import scanner_queue
+        except Exception as exc:
+            log(f"[{SELF_ID}] auto_scan: 스캐너 큐를 불러올 수 없음 — {exc}")
+            self._pending_scan_libs.clear()
+            return
+
+        for entry in sorted(self._pending_scan_libs, key=repr):
+            session, library_id, physical_path = entry
+            try:
+                queued = scanner_queue.enqueue(
+                    "library_scan",
+                    db_type=session,
+                    db_path=database.get_db_path(session),
+                    library_id=library_id,
+                    physical_path=physical_path,
+                    force=False,
+                    trigger_type="gdrive_reading_sync",
+                    is_cron=False,
+                )
+            except Exception as exc:
+                log(f"[{SELF_ID}] auto_scan 큐 등록 실패: {session}/{library_id} — {exc}")
+                continue
+            if queued:
+                self._pending_scan_libs.discard(entry)
+                log(f"[{SELF_ID}] auto_scan: 스캔 큐 등록 {session}/{library_id} {physical_path}")
+
+    @staticmethod
+    def _all_libraries(log=print) -> list:
+        """`(session, library_id, physical_path)` 목록. 조회 실패한 세션은 건너뛴다."""
+        from repositories.category_repository import CategoryRepository
+
+        out = []
+        for session in _WATCHED_SESSIONS:
+            try:
+                rows = CategoryRepository.get_all_libraries(session)
+            except Exception as exc:
+                log(f"[{SELF_ID}] auto_scan: '{session}' 라이브러리 조회 실패 — {exc}")
+                continue
+            for lib in rows or []:
+                out.append((session, lib.get("id"), str(lib.get("physical_path") or "")))
+        return out
 
     # ---- routes (gamebooks 패턴 차용) ----
     def _ensure_routes(self):

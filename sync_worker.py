@@ -1315,11 +1315,14 @@ def process_jobs(
         "failed": 0,
         "bytes_done": 0,
         "errors": [],
+        # 실제로 로컬 트리가 바뀐 폴더들. 호출 측(플러그인)이 이 폴더를 품는
+        # BookOasis 라이브러리만 골라 스캔 큐에 넣는다.
+        "landed_dirs": [],
     }
 
     parallel_n = _parallel_transfers(cfg)
 
-    def _accumulate(out: dict) -> None:
+    def _accumulate(out: dict, job: dict | None = None) -> None:
         st = out.get("status")
         if st == "completed":
             summary["completed"] += 1
@@ -1332,6 +1335,13 @@ def process_jobs(
         summary["bytes_done"] += int(out.get("bytes_done") or 0)
         if out.get("error"):
             summary["errors"].append(f"{out['job_id']}:{out['error']}")
+        # 새 파일이 내려앉았거나(completed) 로컬에서 이름이 바뀐 경우(renamed_*)만
+        # 디스크가 실제로 변했다. duplicate/remote_deleted 는 변화 없음.
+        landed = st == "completed" or str(out.get("result") or "").startswith("renamed")
+        if landed and job is not None:
+            d = os.path.dirname(str(job.get("local_path") or ""))
+            if d and d not in summary["landed_dirs"]:
+                summary["landed_dirs"].append(d)
 
     if parallel_n <= 1 or len(jobs) <= 1:
         # P1 — 기존 직렬 경로. 동작/어휘/요약 순서 동일.
@@ -1349,7 +1359,7 @@ def process_jobs(
                 )
                 out = {"job_id": int(job.get("id")), "status": "retry",
                        "result": "", "bytes_done": 0, "error": str(exc)}
-            _accumulate(out)
+            _accumulate(out, job)
         return summary
 
     # §4.1 — 병렬 경로. 단계:
@@ -1374,7 +1384,7 @@ def process_jobs(
                 )
                 out = {"job_id": int(job.get("id")), "status": "retry",
                        "result": "", "bytes_done": 0, "error": str(exc)}
-            _accumulate(out)
+            _accumulate(out, job)
             continue
         try:
             prepared = _prepare_copy_job(
@@ -1390,7 +1400,7 @@ def process_jobs(
                 "job_id": int(job.get("id")), "status": "retry",
                 "result": "", "bytes_done": 0, "error": str(exc)}}
         if prepared.get("terminal"):
-            _accumulate(prepared["out"])
+            _accumulate(prepared["out"], job)
             continue
         copy_jobs.append(prepared)
 
@@ -1414,10 +1424,10 @@ def process_jobs(
             for prepared in copy_jobs
         }
         for fut in future_to_prepared:
+            prepared = future_to_prepared[fut]
             try:
                 out = fut.result()
             except Exception as exc:
-                prepared = future_to_prepared[fut]
                 job_id = int(prepared["job"].get("id"))
                 log(f"[gdrive_reading_sync] copy future uncaught: {exc}")
                 store.finish_job(
@@ -1426,7 +1436,7 @@ def process_jobs(
                 )
                 out = {"job_id": job_id, "status": "retry",
                        "result": "", "bytes_done": 0, "error": str(exc)}
-            _accumulate(out)
+            _accumulate(out, prepared["job"])
     return summary
 
 
