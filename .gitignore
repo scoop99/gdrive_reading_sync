@@ -40,3 +40,6 @@ scripts/
 # 개인 문서 — 공개 저장소에 넣지 않는다 (개인 경로·작업 이력)
 docs/
 STATUS.md
+
+# 코딩 에이전트 CLI 가 만드는 로컬 캐시
+.commandcode/
