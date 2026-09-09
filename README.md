@@ -31,6 +31,11 @@ Drive를 마운트해서 쓰다 보면 재생·열람이 느리고 마운트가 
   **검증을 통과한 뒤에만** 완료로 기록하므로 깨진 파일이 남지 않음
 - **중복 스킵** — 파일 존재 · 원격 md5 존재 · 크기 일치 · md5 일치, **네 조건을 모두**
   만족할 때만 건너뜀. 크기만 보고 넘기지 않음
+- **자동 스캔 (책 폴더 단위)** — 복사가 끝난 파일이 속한 **책 폴더 하나만** BookOasis
+  증분 스캔(`scan_library_path(..., force=False)`)에 넣어 새로 들어온 권만 등록합니다.
+  파일마다 라이브러리 전체를 다시 훑지 않습니다. `SCAN_DEBOUNCE_SECONDS`(기본 60초)
+  동안 그 폴더에 새 파일이 안 들어오면 스캔하며, 스캔 상태는 목록 화면 경로 칸에
+  한 줄로 표시됩니다.
 - **병렬 전송** — 기본 5. 실제 바이트를 옮기는 작업만 병렬로 돌리고 이름변경 판정은
   직렬이라 경합이 없음
 - **목록 화면** — 서버측 페이징 · 상태/유형/결과 필터 · 검색 · 정렬, 일괄 재처리,
@@ -183,7 +188,8 @@ rclone --config <conf경로> config reconnect myremote:
 | `EXTENSIONS` | 허용 확장자 (쉼표 구분) |
 | `POLL_SECONDS` | 폴링 주기 (기본 60초) |
 | `PARALLEL_TRANSFERS` | 병렬 전송 수 (기본 5, 1이면 직렬) |
-| `AUTO_SCAN` | 복사가 끝난 폴더를 품는 라이브러리를 자동으로 스캔 큐에 등록 (기본 켜짐) |
+| `AUTO_SCAN` | 복사가 끝난 **책 폴더**를 품는 라이브러리를 자동으로 스캔 (기본 켜짐) |
+| `SCAN_DEBOUNCE_SECONDS` | 책 폴더 자동 스캔 디바운스(초). 이 시간 동안 그 폴더에 새 파일이 안 들어오면 스캔 (기본 60) |
 | `JOBS_PER_CYCLE` | 사이클당 처리 상한 |
 | `MAX_ATTEMPTS` / `RCLONE_TIMEOUT` | 재시도 상한 / 명령 타임아웃 |
 | `RETENTION_DAYS` / `AUTO_CLEANUP` | 종결 이력 보존 일수 / 자동 정리 |
@@ -228,7 +234,7 @@ POST /api/webhook/gdrive_reading_sync/rclone-check
 ## 테스트
 
 ```bash
-python test_sync_worker.py     # 오프라인 회귀 68종. 네트워크·BookOasis 불필요
+python test_sync_worker.py     # 오프라인 회귀 84종. 네트워크·BookOasis 불필요
 ```
 
 ## 라이선스

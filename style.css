@@ -185,6 +185,22 @@
     margin-top: 2px;
 }
 
+/* P9 §6.2 — 경로 칸의 스캔 상태 한 줄. gdrs-prev-path 의 크기·여백을 그대로
+ * 따라가 같은 자리, 같은 위계에 둔다. 표 레이아웃·열 너비·페이징은 건드리지 않는다. */
+.gdrs-scan-line {
+    font-size: 0.8rem;
+    color: var(--app-text-muted);
+    margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.gdrs-scan-pending { color: #f59e0b; }
+.gdrs-scan-running { color: var(--app-accent); }
+.gdrs-scan-done { color: #16a34a; }
+.gdrs-scan-failed { color: #dc2626; }
+.gdrs-scan-skipped { color: #94a3b8; }
+
 .gdrs-jobs-table tr:hover td {
   background: var(--app-bg-card-hover);
 }

@@ -2,6 +2,11 @@
   <label class="gdrs-settings-check"><input type="checkbox" name="ENABLE_SYNC"> <span>동기화 활성화</span></label>
   <label class="gdrs-settings-check"><input type="checkbox" name="DRY_RUN" checked> <span>시험 모드 — 변경만 감지하고 파일은 복사하지 않음</span></label>
   <label class="gdrs-settings-check"><input type="checkbox" name="AUTO_SCAN" checked> <span>복사 완료 후 자동 스캔 — 새로 내려온 책을 라이브러리에 자동 등록</span></label>
+  <div class="gdrs-settings-field">
+    <label for="gdrs-setting-scan-debounce">스캔 디바운스 (초)</label>
+    <input id="gdrs-setting-scan-debounce" name="SCAN_DEBOUNCE_SECONDS" type="number" value="60" min="10" max="3600">
+    <p class="gdrs-settings-help">이 시간 동안 그 폴더에 새 파일이 안 들어오면 스캔합니다.</p>
+  </div>
 
   <div class="gdrs-settings-field">
     <label for="gdrs-setting-rclone-bin">rclone 실행 파일</label>

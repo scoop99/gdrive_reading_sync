@@ -61,6 +61,22 @@ _SCHEMA = [
         finished_at TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_job_status ON job(status, id)",
+    # P9 — 복사 완료 후 책 폴더 단위 자동 스캔. 1행 = 1책 폴더 = 1스캔 단위.
+    # queue 를 거치지 않으므로 여기서 debounce(queued_at 기준)와 claim 상태를 관리한다.
+    """CREATE TABLE IF NOT EXISTS scan (
+        folder      TEXT PRIMARY KEY,   -- 로컬 절대경로. 스캔 단위 = 책 폴더
+        session     TEXT NOT NULL DEFAULT 'general',
+        library_id  INTEGER,
+        status      TEXT NOT NULL DEFAULT 'pending',  -- pending|running|done|failed|skipped
+        reason      TEXT NOT NULL DEFAULT '',         -- skipped 사유: library_root|no_library
+        queued_at   TEXT,                             -- 마지막 landing 시각 = 디바운스 기준점
+        started_at  TEXT,
+        finished_at TEXT,
+        files       INTEGER NOT NULL DEFAULT 0,       -- 이번 대기분에 내려앉은 파일 수
+        new_books   INTEGER,                          -- §5.3 / §12-A — 본체 훅으로만 기록. 못 받으면 NULL
+        error       TEXT NOT NULL DEFAULT ''
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_scan_status ON scan(status, queued_at)",
 ]
 
 # 기존 state.db 에 나중에 생긴 컬럼을 붙인다. CREATE TABLE IF NOT EXISTS 로는
@@ -718,6 +734,242 @@ class Store:
             deleted = int(cur.rowcount or 0)
             self._writer.commit()
         return deleted
+
+    # ---- P9 — 복사 완료 후 책 폴더 단위 자동 스캔 ---------------------
+
+    def scan_touch(
+        self, folder: str, session: str, library_id: int | None
+    ) -> None:
+        """§4 / §5.2 — upsert. 기존 행이 `running` 이면 건드리지 않고 조용히 무시
+        (스캔 중 도착분은 다음 landing 이 다시 `scan_touch` 로 잡는다).
+        그 외에는 `status='pending'`, `queued_at=now`, `files=files+1`,
+        `reason=''`, `error=''` 로 재대기시킨다.
+        """
+        now = _now()
+        with _WRITER_LOCK:
+            cur = self._writer.execute(
+                "SELECT status FROM scan WHERE folder = ?", (folder,)
+            )
+            row = cur.fetchone()
+            if row is not None and row[0] == "running":
+                # scan 중 도착 — 이번 대기분은 건드리지 않는 게 안전하다.
+                self._writer.commit()
+                return
+            if row is None:
+                self._writer.execute(
+                    """INSERT INTO scan
+                        (folder, session, library_id, status, queued_at, files)
+                       VALUES (?, ?, ?, 'pending', ?, 1)""",
+                    (folder, session, library_id, now),
+                )
+            else:
+                self._writer.execute(
+                    """UPDATE scan
+                          SET status='pending', queued_at=?, files=files+1,
+                              reason='', error='', started_at=NULL, finished_at=NULL,
+                              new_books=NULL
+                        WHERE folder=?""",
+                    (now, folder),
+                )
+            self._writer.commit()
+
+    def scan_skip(self, folder: str, session: str, reason: str) -> None:
+        """§5.2 — `status='skipped'`, `reason=<사유>`, `finished_at=now` upsert.
+        skipped 는 되집지 않는다 (`scan_claim_due` 는 pending 만 본다).
+        """
+        now = _now()
+        with _WRITER_LOCK:
+            cur = self._writer.execute(
+                "SELECT status FROM scan WHERE folder = ?", (folder,)
+            )
+            row = cur.fetchone()
+            if row is None:
+                self._writer.execute(
+                    """INSERT INTO scan
+                        (folder, session, status, reason, finished_at)
+                       VALUES (?, ?, 'skipped', ?, ?)""",
+                    (folder, session, reason, now),
+                )
+            else:
+                # running 중 skip 은 일어나지 않는다 (§5.2 — folder matching 이
+                # pending 생성 전에 끝난다). 그래도 무조건 덮어쓴다 (스캔 단위 결정).
+                self._writer.execute(
+                    """UPDATE scan
+                          SET status='skipped', reason=?, finished_at=?,
+                              session=?, started_at=NULL, files=0, new_books=NULL,
+                              error=''
+                        WHERE folder=?""",
+                    (reason, now, session, folder),
+                )
+            self._writer.commit()
+
+    def scan_claim_due(self, before_iso: str) -> dict | None:
+        """§4.1 — 프로세스 간 안전하게 pending 된 폴더 1건을 `running` 으로
+        되집는다. 조건부 UPDATE + rowcount 로 정확히 1명만 통과시킨다.
+
+        `_WRITER_LOCK` 은 스레드 락이라 gunicorn 워커 N 개면 못 막는다. sqlite
+        쓰기는 파일 락으로 직렬화되므로 `WHERE status='pending'` 재확인 + rowcount
+        검사가 프로세스 간에도 정확히 1명만 통과시킨다.
+
+        대상 `folder` 는 같은 트랜잭션 안에서 서브쿼리로 읽어 UPDATE 의 WHERE 에
+        못박아 두 프로세스가 같은 폴더를 노려도 하나만 성공하게 한다.
+        """
+        now = _now()
+        with _WRITER_LOCK:
+            # 1) 후보 folder 를 같은 트랜잭션 안에서 읽는다.
+            cur = self._writer.execute(
+                """SELECT folder FROM scan
+                    WHERE status='pending' AND queued_at <= ?
+                    ORDER BY queued_at ASC, folder ASC
+                    LIMIT 1""",
+                (before_iso,),
+            )
+            target = cur.fetchone()
+            if target is None:
+                self._writer.commit()
+                return None
+            folder = target[0]
+            # 2) 조건부 UPDATE — folder+status 재확인 후 running 전이.
+            cur = self._writer.execute(
+                """UPDATE scan
+                      SET status='running', started_at=?
+                    WHERE folder=? AND status='pending'""",
+                (now, folder),
+            )
+            if cur.rowcount != 1:
+                self._writer.commit()
+                return None
+            # 3) 되집은 행 SELECT.
+            cur = self._writer.execute(
+                "SELECT * FROM scan WHERE folder = ?", (folder,)
+            )
+            cols = [d[0] for d in cur.description]
+            row = cur.fetchone()
+            self._writer.commit()
+            if row is None:
+                return None
+            return dict(zip(cols, row))
+
+    def scan_finish(
+        self,
+        folder: str,
+        status: str,
+        new_books: int | None = None,
+        error: str = "",
+    ) -> None:
+        """§5.3 — `status`(done/failed), `finished_at=now`, `new_books`, `error`
+        기록. `files=0` 으로 리셋. skip 보존정리(§12-D)가 놓치지 않게 대상 행을
+        정확히 기록한다.
+        """
+        now = _now()
+        with _WRITER_LOCK:
+            self._writer.execute(
+                """UPDATE scan
+                      SET status=?, finished_at=?, files=0,
+                          new_books=COALESCE(?, new_books), error=?
+                    WHERE folder=?""",
+                (status, now, new_books, error, folder),
+            )
+            self._writer.commit()
+
+    def scan_map(self, folders: list[str]) -> dict:
+        """§5.5 — `list[str]` -> `{folder: row_dict}`. 화면용 조회 전용.
+        빈 리스트면 `{}`. `IN (?,?,...)` 는 500 개 단위로 끊어 읽는다.
+        """
+        if not folders:
+            return {}
+        out: dict[str, dict] = {}
+        with self._reader() as conn:
+            step = 500
+            for i in range(0, len(folders), step):
+                chunk = folders[i:i + step]
+                placeholders = ",".join("?" for _ in chunk)
+                cur = conn.execute(
+                    f"SELECT * FROM scan WHERE folder IN ({placeholders})",
+                    chunk,
+                )
+                for row in cur.fetchall():
+                    out[str(row["folder"])] = dict(row)
+        return out
+
+    def scan_set_new_books(self, library_id: int, n: int) -> None:
+        """§12-A — 본체 `on_scan_new_books_detected` 훅이 나중에 도착했을 때 쓴다.
+
+        그 `library_id` 의 **`running` 또는 가장 최근 `done`** 행이 **정확히 1개**
+        일 때만 `new_books=n` 을 기록한다. 애매하면 아무 것도 안 한다 (본체 cron
+        전체 스캔과 겹쳐 오염되는 것을 줄인다).
+        """
+        with _WRITER_LOCK:
+            # running 우선 — 스캔 도중 또는 막 끝난 우리 스캔이 대상.
+            cur = self._writer.execute(
+                "SELECT folder FROM scan "
+                "WHERE library_id=? AND status='running'",
+                (library_id,),
+            )
+            running = [r[0] for r in cur.fetchall()]
+            if len(running) == 1:
+                self._writer.execute(
+                    "UPDATE scan SET new_books=? WHERE folder=?",
+                    (int(n), running[0]),
+                )
+                self._writer.commit()
+                return
+            if running:
+                # running 이 2개 이상인데 도착하면 귀속 애매 — 아무 것도 안 한다.
+                self._writer.commit()
+                return
+            # running 없으면 가장 최근 done 1건.
+            cur = self._writer.execute(
+                """SELECT folder FROM scan
+                    WHERE library_id=? AND status='done'
+                    ORDER BY finished_at DESC, folder ASC
+                    LIMIT 2""",
+                (library_id,),
+            )
+            done = [r[0] for r in cur.fetchall()]
+            if len(done) == 1:
+                self._writer.execute(
+                    "UPDATE scan SET new_books=? WHERE folder=?",
+                    (int(n), done[0]),
+                )
+            self._writer.commit()
+
+    def scan_recover_running(self) -> int:
+        """§12-E — 프로세스 재시작 시 `status='running'` 고아 행을 `pending` 으로
+        되돌리고 건수를 반환한다. 부분 스캔은 mtime 스킵 덕에 다시 돌려도 싸다.
+        """
+        with _WRITER_LOCK:
+            cur = self._writer.execute(
+                """UPDATE scan
+                      SET status='pending', started_at=NULL, finished_at=NULL
+                    WHERE status='running'"""
+            )
+            n = int(cur.rowcount or 0)
+            self._writer.commit()
+            return n
+
+    def scan_cleanup(self, retention_days: int) -> int:
+        """§12-D — `status IN ('done','failed','skipped')` 이고 `finished_at` 이
+        보존기간 지난 행만 삭제. **`pending` / `running` 은 절대 지우지 않는다.**
+
+        완료 시각은 UTC ISO (`_now()`). retention_days 는 `cleanup_terminal` 과
+        같은 정규화를 호출 측에서 해서 넘긴다.
+        """
+        import datetime as _dt
+        rd = max(1, min(int(retention_days), 3650))
+        utc_now = _dt.datetime.utcnow()
+        cutoff_iso = (utc_now - _dt.timedelta(days=rd)).strftime("%Y-%m-%dT%H:%M:%S")
+        with _WRITER_LOCK:
+            cur = self._writer.execute(
+                """DELETE FROM scan
+                    WHERE status IN ('done','failed','skipped')
+                      AND finished_at IS NOT NULL
+                      AND finished_at < ?""",
+                (cutoff_iso,),
+            )
+            n = int(cur.rowcount or 0)
+            self._writer.commit()
+            return n
 
     # ----- reader helpers (별도 연결) -----
     def _reader(self) -> sqlite3.Connection:

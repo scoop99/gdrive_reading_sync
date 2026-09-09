@@ -64,6 +64,30 @@ def _pick_library(libraries: list, path: str):
     return best
 
 
+def _display_folder(folder: str, local_root: str) -> str:
+    """§5.4 — 로그용 상대경로. 개인 절대경로를 로그에 새지 않기 위함.
+
+    `folder` 가 `LOCAL_ROOT` 아래면 상대경로를 반환한다. 그 밖이거나 `..` 로
+    시작하면(상대경로로 표현 불가) 루트를 떼고 슬래시 정규화만 해서 노출한다 —
+    절대경로의 볼륨·드라이브 문자를 로그에 남기지 않는다 (T-P7-L5).
+    """
+    try:
+        if local_root:
+            rel = os.path.relpath(folder or "", local_root)
+            if not rel.startswith("..") and rel != ".":
+                return rel.replace(os.sep, "/")
+    except ValueError:
+        pass
+    return (folder or "").replace("\\", "/").lstrip("/")
+
+
+def _normpath_eq(a: str, b: str) -> bool:
+    """§5.2 — `_pick_library` 와 같은 정규화로 두 경로의 동등 비교."""
+    return os.path.normcase(os.path.abspath(a or "")) == os.path.normcase(
+        os.path.abspath(b or "")
+    )
+
+
 class _DailyTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
     """**로컬** 자정마다 회전. 활성 파일명 `gdrive_reading_sync.log`,
     회전본은 `gdrive_reading_sync_<YYYYMMDD>.log`.
@@ -242,7 +266,12 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
         {"key": "PARALLEL_TRANSFERS", "label": "병렬 전송 동시 실행 수 (1이면 직렬)", "type": "number", "default": 5},
         # 복사가 끝난 폴더를 품는 라이브러리만 증분 스캔(force=False)에 넣는다.
         {"key": "AUTO_SCAN", "label": "복사 완료 후 자동 스캔", "type": "checkbox", "default": True,
-         "description": "파일이 로컬에 내려앉으면 그 폴더가 속한 BookOasis 라이브러리를 스캔 큐에 넣어 새 책을 자동 등록합니다. 증분 스캔이라 이미 등록된 책은 다시 읽지 않습니다."},
+         "description": "파일이 로컬에 내려앉으면 그 폴더가 속한 BookOasis 라이브러리를 스캔해 새 책을 자동 등록합니다. 증분 스캔이라 이미 등록된 책은 다시 읽지 않습니다."},
+        # P9 — books 폴더 단위 자동 스캔의 디바운스. 새 파일이 안 들어온 채 이 시간이
+        # 지나야 그 폴더를 스캔한다. 티크 주기는 상수 5초 (§5.1).
+        {"key": "SCAN_DEBOUNCE_SECONDS", "label": "스캔 디바운스(초)", "type": "number",
+         "default": 60,
+         "description": "이 시간 동안 그 폴더에 새 파일이 안 들어오면 스캔합니다."},
     ]
     # copy-on-write 기준. _refresh_remote_options() 가 이걸 원본 삼아
     # 새 list 를 만들어 self.config_schema 에 대입한다 (원본 불변).
@@ -335,6 +364,14 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
             log(f"[{SELF_ID}] cleanup failed: {exc}")
             store.set_state(status="error", error=f"cleanup: {exc}", last_poll_at=_iso_now())
             return 0
+        # §12-D — `scan` 행 보존 정리. 같은 RETENTION_DAYS / 같은 1시간 gate 재사용.
+        # pending / running 은 절대 지우지 않는다 (scan_cleanup 이 보장).
+        try:
+            deleted_scans = store.scan_cleanup(retention_days=rd)
+            if deleted_scans:
+                log(f"[{SELF_ID}] cleanup: {deleted_scans} scan row(s) deleted (retention={rd})")
+        except Exception as exc:
+            log(f"[{SELF_ID}] scan_cleanup failed: {exc}")
         self._last_cleanup_monotonic = now_m
         if deleted:
             log(f"[{SELF_ID}] cleanup: {deleted} terminal job(s) deleted (retention={rd})")
@@ -503,6 +540,11 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
 
         thread = threading.Thread(target=self._run_loop, name="gdrive-reading-sync", daemon=True)
         thread.start()
+        # P9 — 폴더 단위 자동 스캔 전용 스레드. `scan_library_path` 는 동기이며
+        # 수 초~수십 초 걸리므로(§3) 폴링 스레드에서 부르면 Drive 감지·복사가
+        # 통째로 멈춘다. debounce 된 pending 를 한 번에 1건만 되집는다 (§5.3).
+        scan_thread = threading.Thread(target=self._scan_loop, name="gdrs-scan", daemon=True)
+        scan_thread.start()
         return None
 
     def _run_loop(self):
@@ -529,6 +571,14 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
         except Exception as exc:
             log_exc(f"[{SELF_ID}] recover_on_start failed")
             store.set_state(status="error", error=f"recover: {exc}", last_poll_at=_iso_now())
+        # §12-E — 스캔 도중 죽어 `running` 으로 남은 고아 행을 `pending` 으로 되돌린다.
+        # 부분 스캔이라 mtime 스킵으로 다시 돌려도 싸다.
+        try:
+            recovered_scans = store.scan_recover_running()
+            if recovered_scans:
+                log(f"[{SELF_ID}] scan recover: {recovered_scans} running -> pending")
+        except Exception as exc:
+            log_exc(f"[{SELF_ID}] scan recover failed")
         try:
             self._refresh_remote_options(cfg0)
         except Exception as exc:
@@ -583,7 +633,7 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
                                 if out.get("claimed"):
                                     log(f"[{SELF_ID}] process_jobs: {out}")
                                 self._auto_scan(
-                                    cfg, out.get("landed_dirs") or [], log=log
+                                    cfg, out.get("landed_dirs") or [], store=store, log=log
                                 )
                         except Exception as exc:
                             log_exc(f"[{SELF_ID}] copy phase failed")
@@ -601,59 +651,45 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
                     pass
             time.sleep(sleep_s)
 
-    # ---- 자동 스캔 (복사 완료 -> BookOasis 라이브러리 스캔 큐) ----
-    # 큐가 중복을 거부하면(이미 pending/running) 여기 남겨 두고 다음 사이클에 재시도한다.
-    _pending_scan_libs: set = set()
+    # ---- 자동 스캔 (복사 완료 -> 폴더 단위 증분 스캔) ----
+    def _auto_scan(self, cfg: dict, landed_dirs: list, store=None, log=print) -> None:
+        """복사가 끝난 폴더 하나를 BookOasis 라이브러리 스캔에 넣는다 (v0.3.4).
 
-    def _auto_scan(self, cfg: dict, landed_dirs: list, log=print) -> None:
-        """복사가 끝난 폴더를 품는 라이브러리만 증분 스캔 큐에 넣는다.
+        v0.3.3 의 전용 큐 등록 방식을 걷어내고, 이 플러그인의 `scan` 테이블에
+        폴더 단위(책 단위) pending 을 남긴다. 실제 스캔은 별도 `gdrs-scan` 스레드가
+        debounce 후 `scan_library_path(folder, force=False)` 로 수행한다.
 
-        `force=False` 라서 이미 등록된 책은 다시 읽지 않는다 — 새로 들어온 것만 추가된다.
-        폴더 감시(watchdog)를 두지 않는 이유: 파일이 언제 내려앉는지는 이 플러그인이
-        직접 알고 있어서 감시할 대상이 없다.
+        `store` 는 폴링 스레드에서 재사용 중인 인스턴스를 넘긴다. 없으면(테스트 등)
+        `open_store(__file__)` 로 새로 만든다.
         """
         if not self._is_truthy(cfg.get("AUTO_SCAN", True)):
-            self._pending_scan_libs.clear()
             return
 
-        if landed_dirs:
-            libraries = self._all_libraries(log=log)
-            for d in landed_dirs:
-                hit = _pick_library(libraries, d)
-                if hit is None:
-                    log(f"[{SELF_ID}] auto_scan: 라이브러리에 없는 경로라 건너뜀 — {d}")
-                    continue
-                self._pending_scan_libs.add(hit)
-
-        if not self._pending_scan_libs:
-            return
-        try:
-            import database
-            from services.scanner_queue import scanner_queue
-        except Exception as exc:
-            log(f"[{SELF_ID}] auto_scan: 스캐너 큐를 불러올 수 없음 — {exc}")
-            self._pending_scan_libs.clear()
+        if not landed_dirs:
             return
 
-        for entry in sorted(self._pending_scan_libs, key=repr):
-            session, library_id, physical_path = entry
-            try:
-                queued = scanner_queue.enqueue(
-                    "library_scan",
-                    db_type=session,
-                    db_path=database.get_db_path(session),
-                    library_id=library_id,
-                    physical_path=physical_path,
-                    force=False,
-                    trigger_type="gdrive_reading_sync",
-                    is_cron=False,
-                )
-            except Exception as exc:
-                log(f"[{SELF_ID}] auto_scan 큐 등록 실패: {session}/{library_id} — {exc}")
+        if store is None:
+            store = open_store(__file__)
+        local_root = (cfg.get("LOCAL_ROOT") or "").strip()
+
+        libraries = self._all_libraries(log=log)
+        for d in landed_dirs:
+            hit = _pick_library(libraries, d)
+            if hit is None:
+                store.scan_skip(d, "general", "no_library")
+                log(f"[{SELF_ID}] scan skip folder={_display_folder(d, local_root)} "
+                    f"reason=no_library")
                 continue
-            if queued:
-                self._pending_scan_libs.discard(entry)
-                log(f"[{SELF_ID}] auto_scan: 스캔 큐 등록 {session}/{library_id} {physical_path}")
+            session, library_id, physical_path = hit
+            # 라이브러리 루트 직하 파일은 스캔 단위(책 폴더)가 아니므로 걸러낸다.
+            if _normpath_eq(d, physical_path):
+                store.scan_skip(d, session, "library_root")
+                log(f"[{SELF_ID}] scan skip folder={_display_folder(d, local_root)} "
+                    f"reason=library_root")
+                continue
+            store.scan_touch(d, session, library_id)
+            log(f"[{SELF_ID}] scan queued  folder={_display_folder(d, local_root)} "
+                f"files=1")
 
     @staticmethod
     def _all_libraries(log=print) -> list:
@@ -670,6 +706,111 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
             for lib in rows or []:
                 out.append((session, lib.get("id"), str(lib.get("physical_path") or "")))
         return out
+
+    # ---- P9 — 스캔 전용 스레드 ---------------------------------------
+
+    @staticmethod
+    def _scan_debounce_seconds(cfg: dict) -> int:
+        """§5.1 — SCAN_DEBOUNCE_SECONDS 정규화. 비수치 60, 10..3600 clamp."""
+        try:
+            v = int(cfg.get("SCAN_DEBOUNCE_SECONDS", 60))
+        except (TypeError, ValueError):
+            v = 60
+        return max(10, min(v, 3600))
+
+    def _scan_loop(self):
+        """§5.3 — `gdrs-scan` 스레드. 5초마다 debounce 된 pending 폴더 1건을
+        되집어 `_run_one_scan` 으로 스캔한다.
+
+        Store 커넥션은 루프 시작 시 1회만 연다 (§12-F). 스레드는 절대 죽으면 안
+        되므로 tick 예외는 전부 logger 로 삼킨다.
+        """
+        store = open_store(__file__)
+        log = logger.info
+        log_exc = logger.exception
+        while True:
+            try:
+                cfg = self._cfg("general")
+                if self._is_truthy(cfg.get("AUTO_SCAN", True)):
+                    debounce = self._scan_debounce_seconds(cfg)
+                    due = _iso_now_offset(-debounce)
+                    row = store.scan_claim_due(due)
+                    if row is not None:
+                        self._run_one_scan(store, row, cfg, log=log, log_exc=log_exc)
+                        continue  # 밀린 게 있으면 쉬지 않고 바로 다음 건
+            except Exception:
+                log_exc(f"[{SELF_ID}] scan loop error")
+            time.sleep(5.0)
+
+    def _run_one_scan(
+        self, store, row: dict, cfg: dict, *, log=print, log_exc=logger.exception
+    ) -> None:
+        """§5.3 — pending 폴더 1건을 `scan_library_path(folder, force=False)` 로
+        스캔하고 `scan_finish` 로 종결한다.
+
+        본체 스캐너가 성공/실패를 예외로만 알린다(§12-A). 예외 없이 끝나면
+        `done` 이고, 예외는 `failed` 로 삼킨다 — 스레드 로직 밖으로 절대 새지
+        않는다 (T-AS6).
+        """
+        import time as _t
+        local_root = (cfg.get("LOCAL_ROOT") or "").strip()
+        try:
+            import database
+            from tools.scanner.core import scan_library_path
+        except Exception as exc:
+            store.scan_finish(row["folder"], "failed",
+                              error=f"import: {type(exc).__name__}: {exc}")
+            log(f"[{SELF_ID}] scan failed  folder="
+                f"{_display_folder(row['folder'], local_root)} error=import:{exc}")
+            return
+        db_path = database.get_db_path(row["session"])
+        log(f"[{SELF_ID}] scan start   folder="
+            f"{_display_folder(row['folder'], local_root)} "
+            f"library={row['session']}#{row['library_id']}")
+        t0 = _t.monotonic()
+        try:
+            # §5.2 — 반드시 폴더 경로. 파일 경로면 os.walk 가 아무것도 안 걸린다(§2).
+            # force=False — §⑮ mtime 스킵으로 기존 권을 재파싱하지 않는다.
+            scan_library_path(db_path, row["library_id"], row["folder"], force=False)
+        except Exception as exc:
+            store.scan_finish(row["folder"], "failed",
+                              error=f"{type(exc).__name__}: {exc}")
+            log(f"[{SELF_ID}] scan failed  folder="
+                f"{_display_folder(row['folder'], local_root)} error={exc}")
+            return
+        store.scan_finish(row["folder"], "done")
+        elapsed = _t.monotonic() - t0
+        log(f"[{SELF_ID}] scan done    folder="
+            f"{_display_folder(row['folder'], local_root)} elapsed={elapsed:.1f}s")
+        self._purge_recent_cache(row["session"], log=log)
+
+    def _purge_recent_cache(self, session: str, log=print) -> None:
+        """§5.3 — 대시보드 cache 를 직접 소거. 실패는 로그만 (스캔 성공은 유지)."""
+        try:
+            from utils.redis_helper import redis_delete_pattern
+            redis_delete_pattern(f"cache:recent_added*:{session}:*")
+        except Exception as exc:
+            log(f"[{SELF_ID}] scan cache purge 실패: {exc}")
+
+    # §12-A — 본체가 scan 완료 시 부르는 훅. 반드시 예외를 밖으로 내지 않는다 (§12-C).
+    def on_scan_new_books_detected(self, db_type, payload) -> None:
+        """본체 `engine.py:828` 가 활성화된 metadata 플러그인에 발행한다.
+
+        payload = {db_type, library_id, library_name, new_books_count, sample_titles}.
+        이 플러그인이 `scan_library_path` 를 직접 부르므로 신규 도서 수는 여기서만
+        받는다 (§5.3). `library_id` 만으로 귀속하므로 본체 cron 전체 스캔과 겹치면
+        어긋날 수 있다 — `scan_set_new_books` 가 후보가 정확히 1개일 때만 기록한다.
+        """
+        # ponytail: library_id 로만 귀속한다. payload 에 경로가 생기면 folder 로
+        #           정확히 맞출 것.
+        try:
+            n = int(payload.get("new_books_count") or 0)
+            lib = payload.get("library_id")
+            if n > 0 and lib is not None:
+                open_store(__file__).scan_set_new_books(int(lib), n)
+        except Exception:
+            logger.exception(f"[{SELF_ID}] on_scan_new_books_detected")
+        return None
 
     # ---- routes (gamebooks 패턴 차용) ----
     def _ensure_routes(self):
@@ -777,6 +918,17 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
                 search=request.args.get("search", default=""),
                 order=request.args.get("order", default="desc"),
             )
+        # §5.5 — job 행의 부모 폴더(= 책 폴더)에 대한 스캔 상태를 `scans` 로 얹는다.
+        # 키는 os.path.dirname(local_path) 원문 그대로 — 프론트가 같은 계산으로 찾는다.
+        # 스캔 정보 때문에 이 목록 라우트가 500 이 나면 안 되므로 실패 시 {} 로 삼킨다.
+        try:
+            job_rows = resp.get("items") or resp.get("jobs") or []
+            folders = {
+                os.path.dirname(j.get("local_path") or "") for j in job_rows if j
+            }
+            resp["scans"] = store.scan_map(sorted(f for f in folders if f))
+        except Exception:
+            resp["scans"] = {}
         return jsonify(resp)
 
     # ponytail: Drive 쓰기 0 — changes GET 만. 강제 1회 재생.
@@ -920,3 +1072,15 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
 
 def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _iso_now_offset(seconds: float) -> str:
+    """`now + seconds` 를 `store._now()` 와 같은 UTC ISO 형식 (초 단위, Z 없음).
+
+    `scan_claim_due` 는 `queued_at`(store._now() 형식) 과 문자열 비교하므로
+    시간대 접미사를 붙이면 경계에서 어긋난다. 같은 형식으로 맞춘다.
+    """
+    import datetime as _dt
+    return (_dt.datetime.utcnow() + _dt.timedelta(seconds=seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )

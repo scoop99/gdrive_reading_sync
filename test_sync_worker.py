@@ -2720,9 +2720,67 @@ def test_T_AS2_landed_dirs_only_for_real_disk_change():
     print("  OK T-AS2 landed_dirs 는 실제 디스크 변화만 (duplicate 제외)")
 
 
-def test_T_AS3_auto_scan_enqueues_once_and_retries_on_reject():
-    """T-AS3 — 큐 등록 성공하면 비우고, 거부되면 남겨 다음 사이클에 재시도. off 면 무동작."""
+def _scan_store():
+    """P9 — Store with scan table seeded + helpers. scan 폴더는 절대경로로 저장된다."""
+    s = _store()
+    return s
+
+
+def _install_scan_tool_stub(fake_scan):
+    """T-AS5/6 — scan_library_path 와 database 를 sys.modules 에 stub 한다.
+
+    `_run_one_scan` 은 함수 내부에서 `import database` / `from tools.scanner.core
+    import scan_library_path` 를 하므로 여기서 등록된 가짜가 그대로 잡힌다.
+    """
     import types as _t
+    sys.modules["database"] = _t.ModuleType("database")
+    sys.modules["database"].get_db_path = lambda db_type="general": f"db:{db_type}"
+    tools = _t.ModuleType("tools")
+    tools.scanner = _t.ModuleType("tools.scanner")
+    scanner_core = _t.ModuleType("tools.scanner.core")
+    scanner_core.scan_library_path = fake_scan
+    sys.modules.setdefault("tools", tools)
+    sys.modules["tools.scanner"] = tools.scanner
+    sys.modules["tools.scanner.core"] = scanner_core
+    return sys.modules["database"]
+
+
+def test_T_AS3_debounce_claim():
+    """T-AS3 — 디바운스: scan_touch 직후 claim_due(now-60s) 는 None.
+
+    queued_at 을 61초 전으로 밀면 정확히 1건 claim 되고 status=running.
+    한 번 claim 된 행은 두 번째 호출에서 다시 안 잡힌다.
+    """
+    import datetime as _dt
+    s = _scan_store()
+    folder = str(Path(tempfile.mkdtemp()) / "만화" / "어떤 책")
+    s.scan_touch(folder, "general", 7)
+
+    now = _dt.datetime.utcnow()
+    # touch 직후 — 너무 최근이라 미정(debounce) → None
+    soon = (now - _dt.timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%S")
+    got = s.scan_claim_due(soon)
+    assert got is None, got
+
+    # queued_at 을 61초 전으로 민다 (즉 debounce 지남)
+    old = (now - _dt.timedelta(seconds=61)).strftime("%Y-%m-%dT%H:%M:%S")
+    s._writer.execute("UPDATE scan SET queued_at=? WHERE folder=?", (old, folder))
+    s._writer.commit()
+
+    row = s.scan_claim_due(old)
+    assert row is not None, "debounce 지났는데 pending 을 못 잡음"
+    assert row["folder"] == folder, row
+    assert row["status"] == "running", row
+    assert row["started_at"], row
+
+    # 두 번째 호출 — 이미 running 이라 None
+    again = s.scan_claim_due(old)
+    assert again is None, again
+    print("  OK T-AS3 디바운스 claim / running 재집어 방지 / 1건")
+
+
+def test_T_AS4_skip_library_root_and_no_library():
+    """T-AS4 — 스킵: library root / 매칭 없음. 두 경우 모두 scan_claim_due 가 안 잡는다."""
     from plugins.metadata.gdrive_reading_sync.gdrive_reading_sync import (
         GdriveReadingSyncMetadataProvider as P,
     )
@@ -2730,45 +2788,298 @@ def test_T_AS3_auto_scan_enqueues_once_and_retries_on_reject():
     lib_dir = root / "READING"
     (lib_dir / "만화").mkdir(parents=True, exist_ok=True)
 
-    calls = []
-    accept = {"v": False}
+    p = P()
+    p._all_libraries = staticmethod(
+        lambda log=print: [("general", 7, str(lib_dir))]
+    )
+    store = _scan_store()
+    logs = []
 
-    def _enqueue(task_type, **kw):
-        calls.append((task_type, kw))
-        return accept["v"]
+    # library root 직하 — folder == physical_path
+    p._auto_scan({"AUTO_SCAN": True, "LOCAL_ROOT": str(lib_dir)},
+                 [str(lib_dir)], store=store, log=logs.append)
+    assert store.scan_map([str(lib_dir)])[str(lib_dir)]["status"] == "skipped"
+    assert store.scan_map([str(lib_dir)])[str(lib_dir)]["reason"] == "library_root"
 
-    sys.modules["database"] = _t.ModuleType("database")
-    sys.modules["database"].get_db_path = lambda db_type="general": f"db:{db_type}"
-    sq = _t.ModuleType("services.scanner_queue")
-    sq.scanner_queue = _t.SimpleNamespace(enqueue=_enqueue)
-    sys.modules.setdefault("services", _t.ModuleType("services"))
-    sys.modules["services.scanner_queue"] = sq
+    # 매칭 없는 폴더
+    outside = str(Path(tempfile.mkdtemp()) / "ELSE")
+    p._auto_scan({"AUTO_SCAN": True, "LOCAL_ROOT": str(lib_dir)},
+                 [outside], store=store, log=logs.append)
+    assert outside in store.scan_map([outside])
+    assert store.scan_map([outside])[outside]["status"] == "skipped"
+    assert store.scan_map([outside])[outside]["reason"] == "no_library"
+
+    # 둘 다 claim_due 로 안 잡힌다
+    import datetime as _dt
+    old = (_dt.datetime.utcnow() - _dt.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    assert all(store.scan_claim_due(old) is None for _ in range(3))
+    print("  OK T-AS4 library_root / no_library skip, claim_due 안 잡음")
+
+
+def test_T_AS5_run_one_scan_contract():
+    """T-AS5 — 호출 계약: fake scan_library_path 가 (db_path, library_id, folder, force=False) 인자,
+    folder 는 폴더다. 성공 시 scan_finish(done)."""
+    from plugins.metadata.gdrive_reading_sync.gdrive_reading_sync import (
+        GdriveReadingSyncMetadataProvider as P,
+    )
+    captured = {}
+
+    def fake_scan(db_path, library_id, target_path, force=False):
+        captured["db_path"] = db_path
+        captured["library_id"] = library_id
+        captured["target_path"] = target_path
+        captured["force"] = force
+
+    _install_scan_tool_stub(fake_scan)
+    s = _scan_store()
+    folder_path = Path(tempfile.mkdtemp()) / "책장" / "A책"
+    folder_path.mkdir(parents=True, exist_ok=True)   # scan_library_path 는 폴더를 요구(§2)
+    folder = str(folder_path)
+    # pending 으로 만들어 claim
+    s.scan_touch(folder, "general", 7)
+    import datetime as _dt
+    old = (_dt.datetime.utcnow() - _dt.timedelta(seconds=61)).strftime("%Y-%m-%dT%H:%M:%S")
+    s._writer.execute("UPDATE scan SET queued_at=? WHERE folder=?", (old, folder))
+    s._writer.commit()
+    row = s.scan_claim_due(old)
+    assert row is not None, row
 
     p = P()
-    p._pending_scan_libs = set()
-    p._all_libraries = staticmethod(lambda log=print: [("general", 7, str(lib_dir))])
+    p._run_one_scan(s, row, {"LOCAL_ROOT": str(Path(folder).parent.parent)},
+                    log=lambda *a: None)
+    assert captured["target_path"] == folder, captured
+    assert captured["library_id"] == 7, captured
+    assert captured["force"] is False, captured
+    assert folder and __import__("os").path.isdir(folder), "세 번째 인자가 폴더가 아님!"
+    scan = s.scan_map([folder])[folder]
+    assert scan["status"] == "done", scan
+    print("  OK T-AS5 scan_library_path 호출 계약 (folder + force=False) + done 기록")
 
-    # off -> 아무 것도 하지 않는다
-    p._auto_scan({"AUTO_SCAN": False}, [str(lib_dir / "만화")], log=lambda *a: None)
-    assert calls == [], calls
 
-    # on + 큐 거부 -> 남는다
-    p._auto_scan({"AUTO_SCAN": True}, [str(lib_dir / "만화")], log=lambda *a: None)
-    assert len(calls) == 1, calls
-    assert calls[0][0] == "library_scan"
-    assert calls[0][1]["library_id"] == 7 and calls[0][1]["force"] is False, calls[0][1]
-    assert p._pending_scan_libs, "거부됐으니 남아 있어야 한다"
+def test_T_AS6_failure_isolation_no_retry():
+    """T-AS6 — 실패 격리: fake 가 예외를 던지면 status=failed, error 기록.
+    스레드 로직이 예외를 밖으로 흘리지 않고, 그 행은 claim_due 로 재시도되지 않는다."""
+    from plugins.metadata.gdrive_reading_sync.gdrive_reading_sync import (
+        GdriveReadingSyncMetadataProvider as P,
+    )
 
-    # 다음 사이클 (새 landed 없음) + 큐 수락 -> 비워진다
-    accept["v"] = True
-    p._auto_scan({"AUTO_SCAN": True}, [], log=lambda *a: None)
-    assert len(calls) == 2, calls
-    assert not p._pending_scan_libs, p._pending_scan_libs
+    def fake_scan(*a, **k):
+        raise FileNotFoundError("missing folder")
 
-    # 더 이상 재시도 없음
-    p._auto_scan({"AUTO_SCAN": True}, [], log=lambda *a: None)
-    assert len(calls) == 2, calls
-    print("  OK T-AS3 자동 스캔 큐 등록 / 거부 재시도 / off 게이트")
+    _install_scan_tool_stub(fake_scan)
+    s = _scan_store()
+    folder = str(Path(tempfile.mkdtemp()) / "책장" / "B책")
+    s.scan_touch(folder, "general", 7)
+    import datetime as _dt
+    old = (_dt.datetime.utcnow() - _dt.timedelta(seconds=61)).strftime("%Y-%m-%dT%H:%M:%S")
+    s._writer.execute("UPDATE scan SET queued_at=? WHERE folder=?", (old, folder))
+    s._writer.commit()
+    row = s.scan_claim_due(old)
+    assert row is not None, row
+
+    p = P()
+    # 예외가 밖으로 안 흘러야 한다
+    p._run_one_scan(s, row, {"LOCAL_ROOT": str(Path(folder).parent.parent)},
+                    log=lambda *a: None)
+    scan = s.scan_map([folder])[folder]
+    assert scan["status"] == "failed", scan
+    assert scan["error"], scan
+
+    # claim_due 로 재시도되지 않는다 — 이미 failed 라 pending 만 본다
+    assert s.scan_claim_due(old) is None, "failed 행이 재시도됨 (무한루프 방지)"
+    print("  OK T-AS6 실패 격리 → failed + 재시도 없음")
+
+
+def test_T_AS7_auto_scan_off_creates_nothing():
+    """T-AS7 — AUTO_SCAN off: _auto_scan 이 scan 테이블에 아무 행도 만들지 않는다."""
+    from plugins.metadata.gdrive_reading_sync.gdrive_reading_sync import (
+        GdriveReadingSyncMetadataProvider as P,
+    )
+    p = P()
+    store = _scan_store()
+    folder = str(Path(tempfile.mkdtemp()) / "만화" / "C책")
+    p._auto_scan({"AUTO_SCAN": False, "LOCAL_ROOT": str(Path(folder))},
+                 [folder], store=store, log=lambda *a: None)
+    assert store.scan_map([folder]) == {}, store.scan_map([folder])
+    print("  OK T-AS7 AUTO_SCAN off → scan 행 0")
+
+
+def test_T_AS8_log_has_no_local_root_absolute_path():
+    """T-AS8 — scan start/done 로그 줄에 LOCAL_ROOT 절대경로가 들어가지 않는다."""
+    from plugins.metadata.gdrive_reading_sync.gdrive_reading_sync import (
+        GdriveReadingSyncMetadataProvider as P,
+    )
+    local_root = Path(tempfile.mkdtemp()) / "LIBRARY"
+    local_root.mkdir(parents=True, exist_ok=True)
+    folder = str(local_root / "만화" / "D책")
+
+    def fake_scan(*a, **k):
+        pass  # 성공
+
+    _install_scan_tool_stub(fake_scan)
+    s = _scan_store()
+    s.scan_touch(folder, "general", 7)
+    import datetime as _dt
+    old = (_dt.datetime.utcnow() - _dt.timedelta(seconds=61)).strftime("%Y-%m-%dT%H:%M:%S")
+    s._writer.execute("UPDATE scan SET queued_at=? WHERE folder=?", (old, folder))
+    s._writer.commit()
+    row = s.scan_claim_due(old)
+    assert row is not None
+
+    logs = []
+    p = P()
+    p._run_one_scan(s, row, {"LOCAL_ROOT": str(local_root)}, log=logs.append)
+    for line in logs:
+        assert str(local_root) not in line, f"절대경로 노출: {line}"
+    print("  OK T-AS8 로그에 LOCAL_ROOT 절대경로 없음 — 상대경로만")
+
+
+def test_T_AS9_multi_process_claim_once():
+    """T-AS9 — 도커/멀티프로세스: 같은 state.db 를 여는 Store 2개가 같은 pending 행을
+    scan_claim_due 하면 정확히 하나만 받고 다른 하나는 None. (§4.1 회귀)"""
+    import datetime as _dt
+    db = Path(tempfile.mkdtemp()) / "state.db"
+    s1 = Store(db)
+    s1.set_state(page_token="t")
+    folder = "/local/만화/공용책"
+    s1.scan_touch(folder, "general", 7)
+    old = (_dt.datetime.utcnow() - _dt.timedelta(seconds=61)).strftime("%Y-%m-%dT%H:%M:%S")
+    s1._writer.execute("UPDATE scan SET queued_at=? WHERE folder=?", (old, folder))
+    s1._writer.commit()
+
+    s2 = Store(db)  # 별도 커넥션 = 별도 프로세스 흉내
+    r1 = s1.scan_claim_due(old)
+    r2 = s2.scan_claim_due(old)
+    results = [r for r in (r1, r2) if r is not None]
+    assert len(results) == 1, (r1, r2)
+    assert results[0]["folder"] == folder
+    print("  OK T-AS9 멀티프로세스 claim — 정확히 1개만 통과")
+
+
+def test_T_AS10_no_direct_bookish_db_sql():
+    """T-AS10 — 정적: 저장소 *.py 에 `get_connection(` 호출 0건.
+    본체 DB 는 CategoryRepository / scan_library_path 를 통해서만 만진다."""
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parent
+    bad = []
+    for py in sorted(root.glob("*.py")):
+        if py.name.startswith("test_"):
+            continue
+        for i, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
+            stripped = line.split("#")[0] if "#" in line and not line.lstrip().startswith("#") else line
+            if "get_connection(" in stripped and stripped.strip():
+                bad.append(f"{py.name}:{i}")
+    assert not bad, bad
+    print("  OK T-AS10 본체 DB get_connection 직접 호출 0건 (정적)")
+
+
+def test_T_AS11_hook_assigns_new_books():
+    """T-AS11 — 훅(then open_store 주입)과 scan_set_new_books:
+    running 1개에 new_books 기록. 후보 0개 / 2개 이상이면 아무 행도 안 바뀐다."""
+    import unittest.mock as _mock
+    import plugins.metadata.gdrive_reading_sync.gdrive_reading_sync as _m
+
+    s = _scan_store()
+    folder = "/local/만화/E책"
+    s.scan_touch(folder, "general", 7)
+    s._writer.execute("UPDATE scan SET status='running' WHERE folder=?", (folder,))
+    s._writer.commit()
+
+    # (1) running 1개 → scan_set_new_books 가 new_books 기록
+    s.scan_set_new_books(7, 3)
+    assert s.scan_map([folder])[folder]["new_books"] == 3
+
+    # (2) 후보 0개 (다른 library_id) → 아무 것도 안 바뀐다
+    s2 = _scan_store()
+    s2.scan_set_new_books(999, 5)
+    assert s2.scan_map([folder]) == {}
+
+    # (3) 후보 2개 이상 (running 2개) → 아무 것도 안 바뀐다
+    s3 = _scan_store()
+    f1 = "/local/only/F1"; f2 = "/local/only/F2"
+    s3.scan_touch(f1, "general", 7); s3.scan_touch(f2, "general", 7)
+    s3._writer.execute("UPDATE scan SET status='running'")
+    s3._writer.commit()
+    before = {k: dict(v) for k, v in s3.scan_map([f1, f2]).items()}
+    s3.scan_set_new_books(7, 9)
+    after = s3.scan_map([f1, f2])
+    for k in (f1, f2):
+        assert after[k]["new_books"] == before[k]["new_books"], (k, before[k], after[k])
+
+    # (4) 훅은 open_store 를 거쳐 scan_set_new_books 를 호출한다 (open_store 주입).
+    p = _m.GdriveReadingSyncMetadataProvider()
+    with _mock.patch.object(_m, "open_store", return_value=s) as _os:
+        p.on_scan_new_books_detected("general", {"library_id": 7, "new_books_count": 4})
+    assert s.scan_map([folder])[folder]["new_books"] == 4
+    print("  OK T-AS11 훅 귀속 — 후보 1개만 기록, 0/2개는 무변경")
+
+
+def test_T_AS12_recover_running():
+    """T-AS12 — running 고아 행을 scan_recover_running() → pending 복귀, 반환 1.
+    그 뒤 claim_due 로 다시 잡힌다."""
+    import datetime as _dt
+    s = _scan_store()
+    folder = "/local/만화/재시작"
+    s.scan_touch(folder, "general", 7)
+    s._writer.execute("UPDATE scan SET status='running' WHERE folder=?", (folder,))
+    s._writer.commit()
+
+    n = s.scan_recover_running()
+    assert n == 1, n
+    assert s.scan_map([folder])[folder]["status"] == "pending"
+
+    old = (_dt.datetime.utcnow() - _dt.timedelta(seconds=61)).strftime("%Y-%m-%dT%H:%M:%S")
+    s._writer.execute("UPDATE scan SET queued_at=? WHERE folder=?", (old, folder))
+    s._writer.commit()
+    row = s.scan_claim_due(old)
+    assert row is not None and row["status"] == "running", row
+    print("  OK T-AS12 재시작 복구 running→pending, 재claim")
+
+
+def test_T_AS13_scan_cleanup_preserves_pending_running():
+    """T-AS13 — 보존 정리: 지난 done/failed/skipped 만 삭제, pending/running 은 절대 안 지운다."""
+    import datetime as _dt
+    s = _scan_store()
+    now = _dt.datetime.utcnow()
+    old = (now - _dt.timedelta(days=40)).strftime("%Y-%m-%dT%H:%M:%S")
+    f_done = "/local/o/done"; f_fail = "/local/o/fail"; f_skip = "/local/o/skip"
+    f_pend = "/local/o/pend"; f_run = "/local/o/run"
+    s.scan_touch(f_done, "general", 7); s.scan_finish(f_done, "done")
+    s.scan_touch(f_fail, "general", 7); s.scan_finish(f_fail, "failed", error="boom")
+    s.scan_touch(f_skip, "general", 7); s.scan_skip(f_skip, "general", "library_root")
+    s.scan_touch(f_pend, "general", 7)
+    s.scan_touch(f_run, "general", 7)
+    s._writer.execute("UPDATE scan SET status='running' WHERE folder=?", (f_run,))
+    # 종결 3건의 finished_at 을 40일 전으로 밀어 보존기간 초과 상태로 만든다.
+    s._writer.execute(
+        "UPDATE scan SET finished_at=? WHERE folder IN (?, ?, ?)",
+        (old, f_done, f_fail, f_skip),
+    )
+    s._writer.commit()
+
+    deleted = s.scan_cleanup(retention_days=30)
+    assert deleted == 3, deleted  # done/failed/skipped
+    m = s.scan_map([f_done, f_fail, f_skip, f_pend, f_run])
+    assert f_done not in m and f_fail not in m and f_skip not in m, "종결 삭제 안 됨"
+    assert f_pend in m and f_run in m, "pending/running 이 삭제됨"
+    assert m[f_pend]["status"] == "pending"
+    assert m[f_run]["status"] == "running"
+    print("  OK T-AS13 보존 정리 — 종결만 삭제, pending/running 보존")
+
+
+def test_T_AS14_hook_never_raises_when_off():
+    """T-AS14 — AUTO_SCAN off 여도 훅은 항상 안전하다 (예외 안 던짐)."""
+    from plugins.metadata.gdrive_reading_sync.gdrive_reading_sync import (
+        GdriveReadingSyncMetadataProvider as P,
+    )
+    p = P()
+    try:
+        p.on_scan_new_books_detected("general", {"library_id": 7, "new_books_count": 2})
+        p.on_scan_new_books_detected("general", {"library_id": 7, "new_books_count": 0})
+        p.on_scan_new_books_detected("general", {})  # 누락 payload
+        print("  OK T-AS14 훅 게이트 — AUTO_SCAN off 여도 예외 없음")
+    except Exception as exc:
+        raise AssertionError(f"on_scan_new_books_detected 예외: {exc}")
 
 
 if __name__ == "__main__":
@@ -2858,10 +3169,21 @@ if __name__ == "__main__":
         test_T_P7_P5_executor_only_receives_copy_jobs,
         test_T_P7_P6_no_direct_writer_execute_in_sync_worker,
         test_T_P7_SYM_T2_PARALLEL_copy_concurrent_speedup,
-        # T3 — 자동 스캔 신규 3종
+        # T3 — 자동 스캔 (v0.3.4 — 폴더 단위 부분 스캔) 신규
         test_T_AS1_pick_library_deepest_match,
         test_T_AS2_landed_dirs_only_for_real_disk_change,
-        test_T_AS3_auto_scan_enqueues_once_and_retries_on_reject,
+        test_T_AS3_debounce_claim,
+        test_T_AS4_skip_library_root_and_no_library,
+        test_T_AS5_run_one_scan_contract,
+        test_T_AS6_failure_isolation_no_retry,
+        test_T_AS7_auto_scan_off_creates_nothing,
+        test_T_AS8_log_has_no_local_root_absolute_path,
+        test_T_AS9_multi_process_claim_once,
+        test_T_AS10_no_direct_bookish_db_sql,
+        test_T_AS11_hook_assigns_new_books,
+        test_T_AS12_recover_running,
+        test_T_AS13_scan_cleanup_preserves_pending_running,
+        test_T_AS14_hook_never_raises_when_off,
     ]
     for fn in tests:
         fn()

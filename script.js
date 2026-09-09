@@ -20,6 +20,7 @@
     pages: 0,
     total: 0,
     selected: new Set(),
+    scans: {},   // P9 — /jobs 의 `scans` (folder 경로 -> scan row dict)
   };
 
   const STATUS_LABEL = {
@@ -117,6 +118,57 @@
     }).formatToParts(d);
     const get = (t) => (parts.find((p) => p.type === t) || {}).value || "";
     return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}:${get("second")}`;
+  }
+
+  // P9 §6.1 — local_path 의 부모 폴더(= 책 폴더). 서버는 Windows 경로(L:\...) 로
+  // 주므로 `\` 와 `/` 둘 다 잘라야 한다.
+  function parentDir(p) {
+    const s = String(p || "");
+    const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+    return i > 0 ? s.slice(0, i) : "";
+  }
+
+  // P9 §6.2 — `scan` 행 한 줄의 문구와 상태 색. new_books 는 훅 미도착이면 null —
+  // 에러가 아니라 정상 경로다(§12-B). null/0 이면 `· 새 도서 N권` 뒷부분만 생략.
+  function scanLineText(scan) {
+    if (!scan) return null;
+    const status = scan.status || "";
+    const fmt = (iso) => fmtKst(iso);
+    if (status === "pending") {
+      const at = scan.queued_at ? fmtDateShort(scan.queued_at) : "-";
+      return { text: `⏳ 스캔 대기 · ${at} 이후 조용하면 시작`, cls: "gdrs-scan-pending", title: scan.queued_at ? fmt(scan.queued_at) : "" };
+    }
+    if (status === "running") {
+      const at = scan.started_at ? fmtDateShort(scan.started_at) : "-";
+      return { text: `🔄 스캔 중… ${at} 시작`, cls: "gdrs-scan-running", title: scan.started_at ? fmt(scan.started_at) : "" };
+    }
+    if (status === "done") {
+      const at = scan.finished_at ? fmtDateShort(scan.finished_at) : "-";
+      let tail = "";
+      if (scan.new_books) tail = ` · 새 도서 ${scan.new_books}권`;
+      return { text: `✅ 스캔 완료 ${at}${tail}`, cls: "gdrs-scan-done", title: scan.finished_at ? fmt(scan.finished_at) : "" };
+    }
+    if (status === "failed") {
+      const err = String(scan.error || "").slice(0, 120);
+      return { text: `❌ 스캔 실패 · ${err}`, cls: "gdrs-scan-failed", title: err };
+    }
+    if (status === "skipped") {
+      const reason = scan.reason === "library_root" ? "라이브러리 루트"
+        : scan.reason === "no_library" ? "보관함 없음" : scan.reason || "";
+      return { text: `⏭ 스캔 안 함 · ${reason}`, cls: "gdrs-scan-skipped", title: reason };
+    }
+    return null;
+  }
+
+  function renderScanLine(pathTd, j) {
+    const scan = state.scans[parentDir(j.local_path)];
+    const line = scanLineText(scan);
+    if (!line) return;   // 스캔 정보가 없으면 아무 줄도 붙이지 않는다 (§6.1)
+    const div = document.createElement("div");
+    div.className = `gdrs-scan-line ${line.cls}`;
+    div.textContent = line.text;
+    if (line.title) div.title = line.title;
+    pathTd.appendChild(div);
   }
 
   function renderStatus(payload) {
@@ -269,6 +321,9 @@
         if (j.error) pathTd.appendChild(rowErrorSpan(j.error));
       }
 
+      // P9 §6.1 — 경로 칸에 스캔 상태 한 줄 (scan 정보가 없으면 아무 줄도 안 붙인다)
+      renderScanLine(pathTd, j);
+
       body.appendChild(tr);
     }
 
@@ -387,6 +442,7 @@
     state.page = Number(data.page || state.page);
     state.pageSize = Number(data.page_size || state.pageSize);
     state.pages = Number(data.pages || 0);
+    state.scans = data.scans || {};   // P9
     const items = (data.items || data.jobs || []);
     renderJobs(items);
     renderPagination();
@@ -473,6 +529,7 @@
       state.page = Number(jb.page || state.page);
       state.pageSize = Number(jb.page_size || state.pageSize);
       state.pages = Number(jb.pages || 0);
+      state.scans = jb.scans || {};   // P9
       renderJobs(jb.items || jb.jobs || []);
       renderPagination();
       renderProgress(jb.summary || null);
