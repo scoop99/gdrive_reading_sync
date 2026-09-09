@@ -45,21 +45,30 @@ Drive를 마운트해서 쓰다 보면 재생·열람이 느리고 마운트가 
 - BookOasis
 - **rclone v1.75.0 이상** — Drive 리모트가 설정돼 있어야 합니다
 - Python 3.10+ — **외부 의존성 없음** (표준 라이브러리만 사용)
+- BookOasis `.env` 에 `ALLOW_PLUGIN_SUBPROCESS=true` (rclone 실행에 필요)
 
 ## 설치
 
-> **폴더를 직접 복사해서 설치합니다.** 플러그인 게시판의 자동 설치는 쓸 수 없습니다 —
-> 게시판이 `subprocess` import 를 금지 패턴으로 차단하는데, 이 플러그인은 rclone
-> 실행이 존재 이유라 `subprocess` 를 뺄 수 없습니다.
->
-> 갱신도 파일을 다시 복사하는 방식입니다. 자동 업데이트(`update_manifest`)는
-> 꺼 두었습니다.
+### 1. `subprocess` 허용 설정 (필수)
 
-1. 이 저장소를 받아 **폴더 전체**를 BookOasis의
-   `plugins/metadata/gdrive_reading_sync/` 에 복사합니다.
-   폴더 이름은 반드시 `gdrive_reading_sync` 여야 합니다 (모듈명·플러그인 id와 일치해야 함).
-2. BookOasis를 재시작합니다.
-3. 환경설정 → 플러그인에서 활성화하고 아래 설정을 채웁니다.
+이 플러그인은 **rclone 실행이 존재 이유**라 `subprocess` 를 씁니다. BookOasis 는 기본적으로
+플러그인의 프로세스 실행을 차단하므로, 본체 `.env` 에 아래를 넣어야 로드됩니다.
+
+```
+# 외부 프로세스 실행
+ALLOW_PLUGIN_SUBPROCESS=true
+```
+
+없으면 로드 단계에서 `SecurityError` 로 차단됩니다. 켜 두면 로드는 허용되고, 어떤
+플러그인이 어떤 호출을 썼는지는 `logs/plugin_subprocess_allowed.log` 에만 기록됩니다
+(대시보드에는 노출되지 않습니다).
+
+> 이 스위치는 **모든** 플러그인에 적용됩니다. 신뢰하는 플러그인만 두세요.
+
+### 2. 파일 배치
+
+폴더 전체를 BookOasis 의 `plugins/metadata/gdrive_reading_sync/` 에 복사합니다.
+폴더 이름은 반드시 `gdrive_reading_sync` 여야 합니다 (모듈명·플러그인 id 와 일치해야 함).
 
 ```
 plugins/metadata/gdrive_reading_sync/
@@ -69,8 +78,19 @@ plugins/metadata/gdrive_reading_sync/
 └── __init__.py   VERSION
 ```
 
-`.py` 를 수정한 뒤에는 **BookOasis를 재시작해야** 반영됩니다. 서버가 모듈을 메모리에
+### 3. 활성화
+
+1. BookOasis 를 재시작합니다.
+2. 환경설정 → 플러그인에서 활성화하고 아래 설정을 채웁니다.
+
+`.py` 를 수정한 뒤에는 **BookOasis 를 재시작해야** 반영됩니다. 서버가 모듈을 메모리에
 들고 있어서, 재시작 없이 하는 확인은 옛 코드에 대고 하는 것입니다.
+
+### 갱신
+
+파일을 다시 복사하고 재시작합니다. 자동 업데이트(`update_manifest`)는 꺼 두었습니다 —
+저장소가 비공개라 `raw.githubusercontent.com` 이 인증 없이 파일을 주지 않습니다.
+저장소를 공개로 전환하면 되살릴 수 있습니다.
 
 ## rclone 준비
 

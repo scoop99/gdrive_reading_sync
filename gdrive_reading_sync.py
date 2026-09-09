@@ -135,6 +135,9 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
     # files 에 런타임 파일을 "전부" 나열해야 한다. 문서 예시는 모듈/__init__/VERSION
     # 세 개뿐이지만, 그대로 두면 gdrive_reading_sync.py 만 새 버전이 되고
     # sync_worker.py·store.py 는 옛 버전으로 남아 확실히 깨진다.
+    #
+    # (subprocess 차단은 본체 ALLOW_PLUGIN_SUBPROCESS=true 로 해소됨 — 2026-09-09.
+    #  이제 남은 조건은 저장소 공개 전환 하나뿐이다.)
     update_manifest = {
         "enabled": False,
         "provider": "github-raw",
