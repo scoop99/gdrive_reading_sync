@@ -160,7 +160,13 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
         "show_sample_update_button": True,
     }
     # copy-on-write 용 베이스. _refresh_remote_options() 가 새 list 를 만들어 대입한다.
-    _BASE_CONFIG_SCHEMA = [
+    # 게시판 설치 검증(plugin_board.py:1648)은 `config_schema` 가
+    #   (a) 어노테이션 없는 일반 대입문이고  (b) 값이 리터럴 리스트
+    # 일 때만 필수 필드로 인정한다. `config_schema: list = _BASE_CONFIG_SCHEMA`
+    # 형태는 둘 다 어겨서 '필수 필드: 클래스에 없음' 으로 설치가 막혔다.
+    # 그래서 리터럴을 config_schema 에 직접 두고, copy-on-write 기준인
+    # _BASE_CONFIG_SCHEMA 는 그 뒤에서 같은 객체를 가리키게 한다.
+    config_schema = [
         {"key": "ENABLE_SYNC", "label": "동기화 활성화", "type": "checkbox", "default": False},
         {"key": "DRY_RUN", "label": "dry_run — 감지만, 복사 안 함 (안전 게이트)", "type": "checkbox", "default": True},
         {"key": "RCLONE_BIN", "label": "rclone 실행 파일", "type": "text", "default": "",
@@ -210,7 +216,9 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
         # 기존 단일 스레드와 100% 같은 코드 경로를 탄다 (§4.1 / 합격선 P1).
         {"key": "PARALLEL_TRANSFERS", "label": "병렬 전송 동시 실행 수 (1이면 직렬)", "type": "number", "default": 5},
     ]
-    config_schema: list = _BASE_CONFIG_SCHEMA
+    # copy-on-write 기준. _refresh_remote_options() 가 이걸 원본 삼아
+    # 새 list 를 만들어 self.config_schema 에 대입한다 (원본 불변).
+    _BASE_CONFIG_SCHEMA = config_schema
     _last_cleanup_monotonic: float = 0.0  # §8.2 — 자동 정리 1시간 gate
     # 3라운드-B T1 — runtime logger 캐시. fingerprint 가 바뀔 때만 handler 를 갈아끼운다.
     _runtime_logger = None  # type: ignore[assignment]
