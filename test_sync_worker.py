@@ -1022,6 +1022,42 @@ def test_local_root_path_and_tmp_root_fallback():
     print("  OK S1 T-S1-03: cfg / fallback / explicit 분기")
 
 
+def test_rclone_fullwidth_slash_escape():
+    """T-P9-01 — 이름 안의 전각 슬래시는 rclone 에 넘길 때 escape 해야 한다.
+
+    운영 실측(2026-09-09): Drive 폴더 '[마블] 스파이더맨／데드풀' 을 그대로 넘기면
+    rclone 이 ／ 를 반각 / 로 되돌려 경로 구분자로 읽어 directory not found (exit 3).
+    rclone 자신은 이 이름을 '스파이더맨‛／데드풀' 로 표현한다.
+    """
+    from plugins.metadata.gdrive_reading_sync.sync_worker import _rclone_remote_escape
+    got = _rclone_remote_escape("만화/마블/[마블] 스파이더맨／데드풀/kavita.yaml")
+    assert got == "만화/마블/[마블] 스파이더맨‛／데드풀/kavita.yaml", got
+    # 구분자 / 는 건드리지 않는다
+    assert _rclone_remote_escape("a/b/c.zip") == "a/b/c.zip"
+    # 전각이 없으면 무변경
+    assert _rclone_remote_escape("만화/일반/x.zip") == "만화/일반/x.zip"
+    print("  OK T-P9-01: 전각 슬래시 escape (‛／), 구분자는 무변경")
+
+
+def test_windows_illegal_char_local_path():
+    """T-P9-02 — Windows 금지 문자는 전각으로 (rclone 로컬 인코딩과 같은 규칙).
+
+    운영 실측: 콜론이 든 이름에서 WinError 123, 끝 마침표에서 WinError 3.
+    """
+    from plugins.metadata.gdrive_reading_sync.sync_worker import _local_path, _win_safe_segment
+    got = _local_path("L:\READING", "책/자/제3의 생각 : 우리는/x.epub")
+    assert ":" not in got[2:], got          # 드라이브 문자의 ':' 만 남아야 한다
+    assert "：" in got, got
+    # 끝 마침표
+    assert _win_safe_segment("로시니 혹은 누가...") .endswith("．"), _win_safe_segment("로시니 혹은 누가...")
+    # 나머지 금지 문자
+    for bad, wide in (("<", "＜"), (">", "＞"), ("|", "｜"), ("?", "？"), ("*", "＊"), ('"', "＂")):
+        assert _win_safe_segment("a%sb" % bad) == "a%sb" % wide
+    # 정상 이름은 무변경
+    assert _win_safe_segment("보통 파일 [저자].zip") == "보통 파일 [저자].zip"
+    print("  OK T-P9-02: Windows 금지 문자 전각 치환, 정상 이름 무변경")
+
+
 def test_no_forced_separator_replacement():
     """T-ALL-02 — 소스에 슬래시→백슬래시 강제 치환 0건. rclone 금지 동사 가드도 유지.
 
@@ -2673,6 +2709,9 @@ if __name__ == "__main__":
         test_local_root_path_and_tmp_root_fallback,
         # T-ALL-02 — 강제 separator 치환 0건 + rclone 금지 동사 가드 유지
         test_no_forced_separator_replacement,
+        # T-P9 — rclone 인코딩 대응 (2026-09-09 운영 실측)
+        test_rclone_fullwidth_slash_escape,
+        test_windows_illegal_char_local_path,
         # S3 — 재시작 attempts 보전 회귀 3종
         test_recover_preserves_attempts_across_restart,
         test_recover_limit_exceeded_at_six,

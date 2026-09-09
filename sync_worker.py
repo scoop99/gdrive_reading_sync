@@ -67,6 +67,55 @@ def _norm_excluded(raw: str) -> set[str]:
     return {e.strip() for e in (raw or "").split(",") if e.strip()}
 
 
+# rclone 인코딩 대응 (2026-09-09 운영 실측으로 확인)
+#
+# rclone 은 백엔드마다 "쓸 수 없는 문자"를 전각 문자로 바꿔 표현하고,
+# 원래 이름에 그 전각 문자가 이미 들어 있으면 `‛`(U+201B) 를 앞에 붙여 구분한다.
+#
+#   Drive 실제 이름   [마블] 스파이더맨／데드풀      (／ = U+FF0F)
+#   rclone 표현       [마블] 스파이더맨‛／데드풀
+#
+# 우리가 `‛` 없이 `／` 를 넘기면 rclone 이 그걸 반각 `/` 로 되돌려 경로 구분자로
+# 해석한다 → directory not found (copyto exit 3). 실측 51건이 이것이었다.
+_RCLONE_ESCAPE = "‛"
+
+# Drive 백엔드 기본 인코딩은 Slash,InvalidUtf8 — 전각 슬래시만 escape 하면 된다.
+_DRIVE_ENCODED = "／"          # ／
+
+# 로컬(Windows) 백엔드 기본 인코딩:
+#   Slash,LtGt,DoubleQuote,Colon,Question,Asterisk,Pipe,BackSlash,Ctl,
+#   RightSpace,RightPeriod,InvalidUtf8
+# Windows 가 파일명에 못 쓰는 문자를 전각으로 바꾼다. 우리가 로컬 경로를 만들 때
+# 같은 규칙을 적용하지 않으면 os.rename/open 이 WinError 123 으로 실패한다 (실측 8건).
+_WIN_ILLEGAL = {
+    "<": "＜", ">": "＞", ":": "：", '"': "＂",
+    "|": "｜", "?": "？", "*": "＊",
+}
+
+
+def _rclone_remote_escape(rel: str) -> str:
+    """rclone 에 넘길 원격 상대경로에서, 이름 안의 전각 슬래시를 escape 한다.
+
+    구분자로 쓰는 `/` 는 그대로 두고, 이름의 일부인 `／` 만 `‛／` 로 바꾼다.
+    """
+    return (rel or "").replace(_DRIVE_ENCODED, _RCLONE_ESCAPE + _DRIVE_ENCODED)
+
+
+def _win_safe_segment(name: str) -> str:
+    """Windows 가 거부하는 문자를 rclone 과 같은 전각 문자로 바꾼다.
+
+    끝의 공백/마침표도 Windows 가 조용히 잘라내므로 전각으로 바꿔 보존한다.
+    """
+    if not name:
+        return name
+    out = "".join(_WIN_ILLEGAL.get(ch, ch) for ch in name)
+    if out.endswith(" "):
+        out = out[:-1] + "␣"      # 끝 공백
+    if out.endswith("."):
+        out = out[:-1] + "．"      # 끝 마침표 (．)
+    return out
+
+
 def _local_path(local_root: str, rel: str) -> str:
     """§3 (S1) — root 문법에 맞는 Pure path 결합.
 
@@ -82,7 +131,10 @@ def _local_path(local_root: str, rel: str) -> str:
         return rel_norm
     # Windows drive/UNC
     if root.startswith("\\\\") or (len(root) >= 2 and root[1] == ":"):
-        path = PureWindowsPath(root) / PureWindowsPath(rel_norm.replace("/", "\\"))
+        # 세그먼트마다 Windows 금지 문자를 전각으로 (rclone 로컬 인코딩과 같은 규칙).
+        # 안 하면 ':' 나 끝 마침표가 든 이름에서 WinError 123 으로 실패한다.
+        safe = "/".join(_win_safe_segment(seg) for seg in rel_norm.split("/"))
+        path = PureWindowsPath(root) / PureWindowsPath(safe.replace("/", "\\"))
         return str(path)
     # POSIX 절대경로
     if root.startswith("/"):
@@ -732,6 +784,8 @@ def build_remote_source(
     if not remote:
         raise ValueError("TRANSFER_REMOTE 설정값 비어 있음")
     rel = (remote_path or "").replace("\\", "/").lstrip("/")
+    # 이름 안의 전각 슬래시는 rclone 이 반각으로 되돌려 구분자로 읽는다 → escape 필수.
+    rel = _rclone_remote_escape(rel)
     kind = resolve_remote_kind(cfg, remote_record)
     if kind == "gds":
         root = (cfg.get("REMOTE_ROOT_PATH") or "").strip().strip("/")
