@@ -178,6 +178,17 @@
       $("gdrs-error-text").textContent = (payload && payload.error) || "응답 실패";
       return;
     }
+    // 제목에 설치 버전 표기 (한 번만 붙인다)
+    const titleEl = document.querySelector(".gdrs-title-group h2");
+    if (titleEl && payload.plugin_version && !titleEl.dataset.ver) {
+      titleEl.dataset.ver = payload.plugin_version;
+      titleEl.appendChild(
+        Object.assign(document.createElement("span"), {
+          className: "gdrs-title-ver",
+          textContent: ` v${payload.plugin_version}`,
+        })
+      );
+    }
     $("gdrs-status-val").textContent = payload.status || "-";
     $("gdrs-last-poll").textContent = fmtKst(payload.last_poll_at);
     const tok = payload.page_token || "";

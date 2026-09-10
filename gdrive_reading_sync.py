@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import glob as _glob
+import json
 import logging
 import logging.handlers
 import os
@@ -38,6 +39,20 @@ logger = logging.getLogger(__name__)
 
 SELF_ID = "gdrive_reading_sync"
 ROUTE_BASE = f"/api/webhook/{SELF_ID}"
+
+
+def _plugin_version() -> str:
+    """설치된 버전 문자열. VERSION 을 못 읽으면 빈 문자열 (표시만 빠지고 동작은 그대로)."""
+    try:
+        raw = (Path(__file__).absolute().parent / "VERSION").read_text(encoding="utf-8")
+        return str(json.loads(raw).get("plugin version") or "").strip()
+    except Exception:
+        return ""
+
+
+# import 시점 1회. 화면 제목과 /status 응답에 실제 설치 버전을 노출한다.
+PLUGIN_VERSION = _plugin_version()
+_VER_SUFFIX = f" v{PLUGIN_VERSION}" if PLUGIN_VERSION else ""
 
 # 자동 스캔이 라이브러리를 찾을 세션 (local_folder_watch 샘플 플러그인과 동일)
 _WATCHED_SESSIONS = ("general", "adult", "audiobook", "video")
@@ -163,10 +178,10 @@ _ROUTES_LOCK = threading.Lock()
 
 class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
     id = "gdrive_reading_sync"
-    name = "구드 독서 동기화"
+    name = "구드 독서 동기화" + _VER_SUFFIX
     is_searchable = False
     category_tab = {
-        "title": "구드 동기화",
+        "title": "구드 동기화" + _VER_SUFFIX,
         "icon": "fa-solid fa-cloud-arrow-down",
         "order": 85,
         "sessions": ["general"],
@@ -883,7 +898,11 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
     # ---- HTTP handlers ----
     def _route_status(self):
         store = open_store(__file__)
-        return jsonify(store.read_status())
+        out = store.read_status()
+        # 화면 제목에 실제 설치 버전을 붙이기 위한 값. 못 읽었으면 빈 문자열.
+        if isinstance(out, dict):
+            out["plugin_version"] = PLUGIN_VERSION
+        return jsonify(out)
 
     def _route_jobs(self):
         from flask import request

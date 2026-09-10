@@ -367,3 +367,12 @@
 .gdrs-result-recovered_tmp_cleanup_failed { background: #dc2626; }
 
 .gdrs-attempts-over { color: #f59e0b; font-weight: 600; }
+
+/* 제목 옆 설치 버전 — 제목보다 한 단계 약하게 */
+.gdrs-title-ver {
+  font-size: 0.72em;
+  font-weight: 600;
+  opacity: 0.65;
+  margin-left: 0.35em;
+  letter-spacing: 0.02em;
+}
