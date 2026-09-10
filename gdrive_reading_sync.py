@@ -181,7 +181,7 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
     name = "구드 독서 동기화" + _VER_SUFFIX
     is_searchable = False
     category_tab = {
-        "title": "구드 동기화" + _VER_SUFFIX,
+        "title": "구드 동기화",   # P11 — 사이드 메뉴 탭에는 버전을 붙이지 않는다 (v0.3.7)
         "icon": "fa-solid fa-cloud-arrow-down",
         "order": 85,
         "sessions": ["general"],

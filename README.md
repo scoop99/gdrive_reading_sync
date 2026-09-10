@@ -176,6 +176,10 @@ rclone --config <conf경로> config reconnect myremote:
 `ENABLE_SYNC` 는 기본 꺼짐, `DRY_RUN` 은 기본 켜짐입니다. 설정을 안 채우면 아무 일도
 일어나지 않습니다.
 
+> 리모트 셀렉트(`TRANSFER_REMOTE` / `DETECT_REMOTE`)의 목록은 설정 화면 진입 시
+> 자동으로 채워집니다. 조회가 실패해도 저장되어 있던 값은 그대로 선택된 상태로
+> 유지되며, 저장만 눌러도 설정이 사라지지 않습니다.
+
 ## 설정
 
 환경설정 → 플러그인 → 구드 독서 동기화.
@@ -243,6 +247,7 @@ POST /api/webhook/gdrive_reading_sync/rclone-check
 
 ```bash
 python test_sync_worker.py     # 오프라인 회귀 93종. 네트워크·BookOasis 불필요
+node test_settings_js.js       # 설정 화면 순수 함수 회귀 7케이스
 ```
 
 ## 라이선스

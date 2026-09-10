@@ -1,3 +1,35 @@
+// P11 — 셀렉트에 넣을 옵션 목록과 선택값을 정한다. DOM 을 만지지 않는 순수 함수.
+//
+// 규칙:
+//  - 저장값이 있으면 **무슨 일이 있어도 그 값을 선택**한다. 목록 조회가 실패했거나
+//    목록에 없더라도 옵션으로 만들어 유지한다 (missing: true 로 표시).
+//  - 저장값이 없을 때만 목록의 첫 항목을 기본값으로 쓴다.
+//  - 저장값을 다른 값으로 **갈아치우지 않는다.** 그게 이 버그의 본질이다.
+//
+// @param {string[]} remotes 조회된 리모트 이름 목록 (실패 시 빈 배열)
+// @param {string}   saved   저장된 선택값 ('' 가능)
+// @returns {{options: {value: string, missing: boolean}[], selected: string}}
+function pickRemoteOptions(remotes, saved) {
+  const list = Array.isArray(remotes) ? remotes.filter(Boolean).map(String) : [];
+  const cur = String(saved || '').trim();
+  const options = list.map((value) => ({ value, missing: false }));
+  if (cur && !list.includes(cur)) {
+    // 저장값이 목록에 없다 — 버리지 말고 맨 앞에 살려 둔다.
+    options.unshift({ value: cur, missing: true });
+  }
+  const selected = cur || (list.length ? list[0] : '');
+  return { options, selected };
+}
+
+// 테스트용 export (반드시 이 형태). new Function 스코프에는 module 이 없어
+// typeof module 이 'undefined' 로 평가된다 — 단락 평가라 브라우저에서 안전하다.
+// CJS require 로 로드되면 여기서 export 하고 즉시 return 해 아래 DOM 코드가
+// 실행되지 않게 한다 (test_settings_js.js 에서 순수 함수만 테스트한다).
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { pickRemoteOptions };
+  return;
+}
+
 const endpoint = `/api/webhook/${pluginId}/rclone-check`;
 const field = (name) => root.querySelector(`[name="${name}"]`);
 const binaryInput = field('RCLONE_BIN');
@@ -13,17 +45,23 @@ function showResult(kind, message, state) {
 }
 
 function setRemoteOptions(remotes) {
-  if (!Array.isArray(remotes) || !remotes.length) return;
-  [transferSelect, detectSelect].forEach((select) => {
+  [
+    [transferSelect, 'TRANSFER_REMOTE'],
+    [detectSelect, 'DETECT_REMOTE'],
+  ].forEach(([select, key]) => {
     if (!select) return;
-    const oldValue = select.value;
-    select.replaceChildren(...remotes.map((name) => {
-      const option = document.createElement('option');
-      option.value = name;
-      option.textContent = name;
-      return option;
-    }));
-    select.value = remotes.includes(oldValue) ? oldValue : remotes[0];
+    // 저장값이 정본이다. 이미 셀렉트에 선택된 값이 있으면 그걸, 없으면 config 의 값을 쓴다.
+    const saved = String(select.value || (config && config[key]) || '').trim();
+    const { options, selected } = pickRemoteOptions(remotes, saved);
+    select.replaceChildren(
+      ...options.map((o) => {
+        const el = document.createElement('option');
+        el.value = o.value;
+        el.textContent = o.missing ? `${o.value} (설정값 — 목록에 없음)` : o.value;
+        return el;
+      })
+    );
+    select.value = selected;
   });
 }
 
@@ -77,7 +115,14 @@ root.querySelectorAll('[data-check]').forEach((button) => {
   });
 });
 
-// 빈 값은 서버의 실제 PATH/BookOasis 폴백을 확인한 뒤 명시적인 기본 경로로 채운다.
-if ((binaryInput && !binaryInput.value.trim()) || (configInput && !configInput.value.trim())) {
-  checkRclone('config', {quiet: true});
-}
+// P11 — 초기화 두 단계.
+// 1단계 — 즉시. 저장값으로 옵션을 만들어 선택한다.
+//   본체 applyConfigValues 는 option 이 없는 select 에 값을 못 넣는다
+//   (plugins.js:215). 여기서 복원하지 않으면, 사용자가 화면을 열고 저장만 눌러도
+//   빈 문자열이 저장돼 동기화가 멈춘다 (plugins.js:324 가 select 를 그대로 긁는다).
+setRemoteOptions([]);
+
+// 2단계 — 조용히 실제 목록을 채운다. 조건 없이 항상.
+//   기존에는 RCLONE_BIN/RCLONE_CONFIG 가 비었을 때만 조회해서, 첫 저장 이후로는
+//   목록이 영영 비어 있었다.
+checkRclone('config', { quiet: true });
