@@ -252,7 +252,12 @@ POST /api/webhook/gdrive_reading_sync/rclone-check
 ```bash
 python test_sync_worker.py     # 오프라인 회귀 93종. 네트워크·BookOasis 불필요
 node test_settings_js.js       # 설정 화면 순수 함수 회귀 7케이스
+node test_script_js.js         # 진행률 계산 순수 함수 회귀 7케이스
 ```
+
+## 변경 이력
+
+[CHANGELOG.md](CHANGELOG.md) — 버전별 변경 내용과 그렇게 한 이유.
 
 ## 라이선스
 
