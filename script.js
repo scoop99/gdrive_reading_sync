@@ -1,4 +1,41 @@
 (function () {
+  // 종결 상태 — 더 이상 처리되지 않는다. 진행률의 분자.
+  const TERMINAL_STATUSES = ["completed", "skipped", "failed"];
+  // 아직 남은 상태.
+  const PENDING_STATUSES = ["queued", "retry", "processing", "dry_run"];
+
+  /**
+   * 진행률 계산. DOM 을 만지지 않는 순수 함수 — test_script_js.js 가 이걸 검증한다.
+   *
+   * 구 화면은 `전체 N건 · 완료 M` 이었는데 `완료` 가 status='completed' 만 세서,
+   * 중복 판정으로 끝난 수십만 건이 진행에 반영되지 않았다. 실제 84% 진행을
+   * 1% 처럼 보이게 했다. 여기서는 **종결(완료+중복+실패) / 전체** 로 낸다.
+   *
+   * statusCounts 가 없으면(구 응답 호환) completed 만으로 계산한다.
+   */
+  function computeProgress(summary, statusCounts) {
+    const sm = summary || {};
+    const counts = statusCounts || {};
+    const at = (k) => Number(counts[k] || 0);
+    const total = Number(sm.all || 0);
+    const known = Object.keys(counts).length > 0;
+    const done = known
+      ? TERMINAL_STATUSES.reduce((a, k) => a + at(k), 0)
+      : Number(sm.completed || 0);
+    const left = known
+      ? PENDING_STATUSES.reduce((a, k) => a + at(k), 0)
+      : Math.max(0, total - done);
+    const pct = total > 0 ? (done / total) * 100 : 0;
+    return { total, done, left, pct };
+  }
+
+  // 테스트용 export. new Function / 브라우저 스코프에는 module 이 없어
+  // typeof 검사에서 단락 평가된다 (settings.js 와 같은 형태).
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = { computeProgress };
+    return;
+  }
+
   const PLUGIN_ID = "gdrive_reading_sync";
   const API_STATUS = `/api/webhook/${PLUGIN_ID}/status`;
   const API_JOBS = `/api/webhook/${PLUGIN_ID}/jobs`;
@@ -345,11 +382,64 @@
       `표시 ${start}-${end} / 전체 ${state.total}건 · ${state.pages}페이지`;
   }
 
-  function renderProgress(summary) {
-    const el = $("gdrs-progress-summary");
-    if (!summary) { el.textContent = ""; return; }
-    const bytes = fmtBytes(summary.bytes_done);
-    el.textContent = `전체 ${summary.all}건 · 완료 ${summary.completed} · ${bytes}`;
+  const nfmt = (n) => Number(n || 0).toLocaleString("ko-KR");
+
+  /**
+   * 진행 상황 표시.
+   *
+   * 구 버전은 `전체 N건 · 완료 M · 바이트` 였는데 세 값이 모두 오해를 불렀다.
+   * `전체` 는 감지 이력 총계라 할 일처럼 보이고, `완료` 는 status='completed' 만
+   * 세서 실제로 중복 판정된 수십만 건이 진행에 반영되지 않았다. 남은 건수는
+   * 아예 없어서 화면만 보고는 얼마나 남았는지 알 수 없었다.
+   *
+   * 이제 종결(완료+중복+실패) / 전체 로 진행률을 내고, 남은 건수와 복사·중복·실패를
+   * 각각 따로 보여준다.
+   */
+  function renderProgress(summary, statusCounts) {
+    const pctEl = $("gdrs-progress-pct");
+    const sumEl = $("gdrs-progress-summary");
+    const fillEl = $("gdrs-progress-fill");
+    const trackEl = $("gdrs-progress-track");
+    const detEl = $("gdrs-progress-detail");
+    if (!summary) {
+      if (sumEl) sumEl.textContent = "";
+      if (pctEl) pctEl.textContent = "–";
+      if (fillEl) fillEl.style.width = "0%";
+      if (detEl) detEl.textContent = "";
+      return;
+    }
+
+    const counts = statusCounts || {};
+    const at = (k) => Number(counts[k] || 0);
+    const { total, done, left, pct } = computeProgress(summary, statusCounts);
+
+    if (pctEl) pctEl.textContent = `${pct.toFixed(1)}%`;
+    if (sumEl) sumEl.textContent = `${nfmt(done)} / ${nfmt(total)} 처리 · 남음 ${nfmt(left)}`;
+    if (fillEl) fillEl.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+    if (trackEl) trackEl.setAttribute("aria-valuenow", pct.toFixed(1));
+
+    if (detEl) {
+      detEl.replaceChildren();
+      const chip = (label, value, cls) => {
+        if (!value) return;
+        const el = document.createElement("span");
+        el.className = `gdrs-progress-chip${cls ? " " + cls : ""}`;
+        el.textContent = `${label} ${nfmt(value)}`;
+        detEl.appendChild(el);
+      };
+      chip("복사", at("completed") || Number(summary.completed || 0), "is-copied");
+      const bytes = fmtBytes(summary.bytes_done);
+      if (bytes && bytes !== "-") {
+        const el = document.createElement("span");
+        el.className = "gdrs-progress-chip is-bytes";
+        el.textContent = bytes;
+        detEl.appendChild(el);
+      }
+      chip("중복", at("skipped"), "is-dup");
+      chip("처리 중", at("processing"), "is-run");
+      chip("재시도", at("retry"), "is-retry");
+      chip("실패", at("failed"), "is-failed");
+    }
   }
 
   function renderPagination() {
@@ -457,7 +547,7 @@
     const items = (data.items || data.jobs || []);
     renderJobs(items);
     renderPagination();
-    renderProgress(data.summary || null);
+    renderProgress(data.summary || null, data.status_counts || null);
     // worker_status 도 표시 가능하면 summary 카드에 노출 (data.worker_status)
     if (data.worker_status) {
       const sv = $("gdrs-status-val");
@@ -543,7 +633,7 @@
       state.scans = jb.scans || {};   // P9
       renderJobs(jb.items || jb.jobs || []);
       renderPagination();
-      renderProgress(jb.summary || null);
+      renderProgress(jb.summary || null, jb.status_counts || null);
     } catch (exc) {
       $("gdrs-status-val").textContent = "error";
       $("gdrs-error-row").hidden = false;

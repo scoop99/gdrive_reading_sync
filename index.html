@@ -16,7 +16,15 @@
   </div>
 
   <div class="gdrs-progress-bar" id="gdrs-progress-bar">
-    <span class="gdrs-progress-summary" id="gdrs-progress-summary">불러오는 중…</span>
+    <div class="gdrs-progress-head">
+      <span class="gdrs-progress-pct" id="gdrs-progress-pct">–</span>
+      <span class="gdrs-progress-summary" id="gdrs-progress-summary">불러오는 중…</span>
+    </div>
+    <div class="gdrs-progress-track" id="gdrs-progress-track" role="progressbar"
+         aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div class="gdrs-progress-fill" id="gdrs-progress-fill"></div>
+    </div>
+    <div class="gdrs-progress-detail" id="gdrs-progress-detail"></div>
   </div>
 
   <div class="gdrs-jobs-panel">
