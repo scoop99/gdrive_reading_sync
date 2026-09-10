@@ -2076,13 +2076,13 @@ def test_T_P7_L8_poll_log_accounts_for_every_change():
     line = line[0]
 
     for key in ("folders", "out_of_root", "excluded", "ext_skip",
-                "probe_skip", "resolve_err", "jobs", "changes"):
+                "probe_skip", "unchanged_skip", "resolve_err", "jobs", "changes"):
         assert key + "=" in line, "poll 로그에 %s 가 없다: %s" % (key, line)
 
     got = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", line)}
     accounted = (got["jobs"] + got["folders"] + got["out_of_root"]
                  + got["excluded"] + got["ext_skip"] + got["probe_skip"]
-                 + got["resolve_err"])
+                 + got["unchanged_skip"] + got["resolve_err"])
     assert got["changes"] <= accounted, (
         "changes=%d 인데 설명된 건 %d 뿐 — 잔여 %d건이 로그로 설명되지 않는다: %s"
         % (got["changes"], accounted, got["changes"] - accounted, line))
@@ -3082,6 +3082,215 @@ def test_T_AS14_hook_never_raises_when_off():
         raise AssertionError(f"on_scan_new_books_detected 예외: {exc}")
 
 
+# ============================================================================
+# P10 — 무변경 EDIT 이벤트 억제 (v0.3.6) 신규 8종
+# ============================================================================
+# build_change_event 는 삭제 삽입 팩토리를 못 쓰는 순수함수라 바로 호출할 수 있고,
+# T-P10-8 만 poll_once 경유로 upsert_item 순서를 본다.
+
+def test_T_P10_1_same_content_returns_none():
+    """T-P10-1 — size·md5 같고 경로 같으면 build_change_event → None."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import build_change_event
+    prev = {"remote_path": "a/b.pdf", "size": 10, "md5": "abc", "is_directory": False}
+    cur = {"remote_path": "a/b.pdf", "size": 10, "md5": "abc", "is_directory": False}
+    assert build_change_event(prev, cur) is None
+    print("  OK T-P10-1 동일 size+md5 → None")
+
+
+def test_T_P10_2_md5_differs_edit():
+    """T-P10-2 — md5 가 다르면 edit 유지."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import build_change_event
+    prev = {"remote_path": "a/b.pdf", "size": 10, "md5": "abc", "is_directory": False}
+    cur = {"remote_path": "a/b.pdf", "size": 10, "md5": "def", "is_directory": False}
+    ev = build_change_event(prev, cur)
+    assert ev is not None and ev["action"] == "edit", ev
+    print("  OK T-P10-2 md5 다름 → edit")
+
+
+def test_T_P10_3_md5_same_size_differs_edit():
+    """T-P10-3 — md5 같아도 size 다르면 edit (한쪽만 보고 억제 안 함)."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import build_change_event
+    prev = {"remote_path": "a/b.pdf", "size": 10, "md5": "abc", "is_directory": False}
+    cur = {"remote_path": "a/b.pdf", "size": 20, "md5": "abc", "is_directory": False}
+    ev = build_change_event(prev, cur)
+    assert ev is not None and ev["action"] == "edit", ev
+    print("  OK T-P10-3 md5 같아도 size 다름 → edit")
+
+
+def test_T_P10_4_missing_md5_edit():
+    """T-P10-4 — 한쪽이라도 md5 비면 edit (Google Docs 류 보호)."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import build_change_event
+    prev = {"remote_path": "a/b.pdf", "size": 10, "md5": "", "is_directory": False}
+    cur = {"remote_path": "a/b.pdf", "size": 10, "md5": "", "is_directory": False}
+    ev = build_change_event(prev, cur)
+    assert ev is not None and ev["action"] == "edit", ev
+    prev2 = {"remote_path": "a/b.pdf", "size": 10, "md5": "abc", "is_directory": False}
+    cur2 = {"remote_path": "a/b.pdf", "size": 10, "md5": "", "is_directory": False}
+    assert build_change_event(prev2, cur2)["action"] == "edit"
+    print("  OK T-P10-4 md5 누락 → edit 유지")
+
+
+def test_T_P10_5_directory_same_path_none():
+    """T-P10-5 — item_type='directory' + 같은 경로 → None."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import build_change_event
+    prev = {"remote_path": "a/폴더", "size": 0, "md5": "", "is_directory": True}
+    cur = {"remote_path": "a/폴더", "size": 0, "md5": "", "is_directory": True}
+    assert build_change_event(prev, cur) is None
+    print("  OK T-P10-5 디렉터리 같은 경로 → None")
+
+
+def test_T_P10_6_modified_time_only_change_none():
+    """T-P10-6 — modified_time 만 바뀌고 size·md5 같으면 None (운영 76,008건 핵심)."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import build_change_event
+    prev = {"remote_path": "a/b.pdf", "size": 10, "md5": "abc",
+            "is_directory": False, "modified_time": "2026-09-01T00:00:00Z"}
+    cur = {"remote_path": "a/b.pdf", "size": 10, "md5": "abc",
+           "is_directory": False, "modified_time": "2026-09-02T00:00:00Z"}
+    assert build_change_event(prev, cur) is None
+    print("  OK T-P10-6 modified_time 만 변경 → None")
+
+
+def test_T_P10_7_rename_create_delete_preserved():
+    """T-P10-7 판정 순서 회귀 — delete/create/rename 은 종전과 동일.
+    경로가 바뀌면 내용이 같아도 rename 이 나와야 한다 (억제 게이트가 rename 을 삼키면 안 됨)."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import build_change_event
+    # delete
+    assert build_change_event({"remote_path": "a/b.pdf"}, None)["action"] == "delete"
+    # create
+    assert build_change_event(None, {"remote_path": "a/b.pdf"})["action"] == "create"
+    # rename — 경로 다름 + 내용 동일 → 반드시 rename
+    prev = {"remote_path": "a/old.pdf", "size": 10, "md5": "abc", "is_directory": False}
+    cur = {"remote_path": "a/new.pdf", "size": 10, "md5": "abc", "is_directory": False}
+    ev = build_change_event(prev, cur)
+    assert ev is not None and ev["action"] == "rename", ev
+    print("  OK T-P10-7 delete/create/rename 판정 순서 회귀 유지")
+
+
+def test_T_P10_8_upsert_item_before_event_and_no_job_on_repeat():
+    """T-P10-8 (가장 중요) — 억제된 변경(None)에서도 item 이 갱신되고,
+    같은 변경을 반복 폴링해도 job 이 안 쌓인다.
+
+    가짜 store 로 upsert_item 호출을 관찰하고, 같은 변경을 두 번 폴링해도
+    두 번째에 job 이 안 생김을 확인한다. §3 함정(upsert_item 을 건너뛰어
+    같은 변경이 영원히 되돌아오는 무한루프)이 살아나지 않게 하는 회귀.
+    """
+    import unittest.mock as _mock
+    from plugins.metadata.gdrive_reading_sync import sync_worker as _sw
+
+    # 기존 item 캐시: 같은 remote_path + 같은 size/md5 (무변경 EDIT 예정).
+    store = _store()
+    store.upsert_item({
+        "file_id": "x1",
+        "parent_id": "f_spark",
+        "name": "SPARK 2018.10#100.pdf",
+        "remote_path": "잡지/SPARK/SPARK 2018.10#100.pdf",
+        "is_directory": False,
+        "size": 1000,
+        "md5": "abc",
+    })
+
+    obs = []
+
+    class _ObservingStore:
+        """Store 의 upsert_item/job 쓰기를 관찰하는 얇은 래퍼 (SQLite 는 실제 사용)."""
+        def __init__(self, s):
+            self._s = s
+            self.upsert_item_calls = 0
+            self.job_calls = 0
+
+        def get_state(self):
+            return self._s.get_state()
+
+        def set_state(self, **kw):
+            self._s.set_state(**kw)
+
+        def get_item(self, fid):
+            return self._s.get_item(fid)
+
+        def upsert_item(self, item):
+            self.upsert_item_calls += 1
+            self._s.upsert_item(item)
+
+        def delete_item(self, fid):
+            self.obs.append("delete:" + fid)
+            self._s.delete_item(fid)
+
+        def upsert_job(self, job):
+            self.job_calls += 1
+            self._s.upsert_job(job)
+
+    obs0 = _ObservingStore(store)
+    client = FakeClient([{
+        "changes": [{
+            "fileId": "x1",
+            "file": _file("x1", "SPARK 2018.10#100.pdf", "f_spark",
+                          mtime="2026-09-02T00:00:00Z", size=1000),
+        }],
+        "newStartPageToken": "9999",
+    }])
+    # md5 를 기존과 같게 맞춘다 (FakeClient _file 은 md5='abc' 고정).
+    # modified_time 만 바뀌므로 same_content(≤md5·size 동일) → None.
+
+    s1 = poll_once(client, obs0, CFG, log=lambda *a: None)
+    assert s1["jobs_created"] == 0, s1
+    assert s1["unchanged_skipped"] == 1, s1
+    assert obs0.upsert_item_calls >= 1, "억제된 변경도 upsert_item 은 실행돼야 한다 (§3)"
+
+    # 같은 변경 두 번째 폴링 — 여전히 previous 가 여전히 같아 None, job 0 유지.
+    client2 = FakeClient([{
+        "changes": [{
+            "fileId": "x1",
+            "file": _file("x1", "SPARK 2018.10#100.pdf", "f_spark",
+                          mtime="2026-09-03T00:00:00Z", size=1000),
+        }],
+        "newStartPageToken": "9999",
+    }])
+    s2 = poll_once(client2, obs0, CFG, log=lambda *a: None)
+    assert s2["jobs_created"] == 0, s2
+    assert obs0.job_calls == 0, "무변경 EDIT 가 job 으로 새어 나오면 안 됨"
+    print("  OK T-P10-8 upsert_item 가 event 판정보다 앞선다 + 반복 폴링해도 job 0")
+
+
+def test_T_P10_9_get_item_roundtrip_size_md5():
+    """T-P10-9 — upsert_item 으로 넣은 size/md5 를 get_item 이 그대로 돌려준다.
+
+    설계 §2.1 정정 — get_item 이 size/md5 를 안 SELECT 해서 `_same_remote_content` 의
+    prev_md5 가 빈 문자열이 되는 구멍을 막는다. 저장→조회 왕복이 대칭이어야 억제가
+    동작한다.
+    """
+    s = _store()
+    s.upsert_item({
+        "file_id": "rt1",
+        "parent_id": "p",
+        "name": "b.pdf",
+        "remote_path": "a/b.pdf",
+        "is_directory": False,
+        "size": 12345,
+        "md5": "d41d8cd98f00b204e9800998ecf8427e",
+    })
+    item = s.get_item("rt1")
+    assert item is not None, "get_item 이 행을 못 찾음"
+    # 기존 4개 키 — 이름·타입 불변
+    assert item["parent_id"] == "p" and item["name"] == "b.pdf"
+    assert item["remote_path"] == "a/b.pdf" and item["is_directory"] is False
+    # P10 신규 2개 키 — 왕복 대칭
+    assert item["size"] == 12345, item["size"]
+    assert item["md5"] == "d41d8cd98f00b204e9800998ecf8427e", item["md5"]
+    # NULL 예외 — size/md5 가 비면 정규화 (int 0 / 빈 문자열)
+    s.upsert_item({
+        "file_id": "rt2",
+        "parent_id": "p",
+        "name": "c.pdf",
+        "remote_path": "a/c.pdf",
+        "is_directory": False,
+        "size": None,
+        "md5": "",
+    })
+    item2 = s.get_item("rt2")
+    assert item2["size"] == 0 and item2["md5"] == "", item2
+    print("  OK T-P10-9 get_item size/md5 왕복 대칭 (NULL 정규화 포함)")
+
+
 if __name__ == "__main__":
     tests = [
         # 기존 6종 (1라운드 회귀)
@@ -3184,6 +3393,16 @@ if __name__ == "__main__":
         test_T_AS12_recover_running,
         test_T_AS13_scan_cleanup_preserves_pending_running,
         test_T_AS14_hook_never_raises_when_off,
+        # P10 — 무변경 EDIT 이벤트 억제 (v0.3.6) 신규 9종
+        test_T_P10_1_same_content_returns_none,
+        test_T_P10_2_md5_differs_edit,
+        test_T_P10_3_md5_same_size_differs_edit,
+        test_T_P10_4_missing_md5_edit,
+        test_T_P10_5_directory_same_path_none,
+        test_T_P10_6_modified_time_only_change_none,
+        test_T_P10_7_rename_create_delete_preserved,
+        test_T_P10_8_upsert_item_before_event_and_no_job_on_repeat,
+        test_T_P10_9_get_item_roundtrip_size_md5,
     ]
     for fn in tests:
         fn()

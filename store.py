@@ -268,9 +268,16 @@ class Store:
             self._writer.commit()
 
     def get_item(self, file_id: str) -> dict | None:
-        """경로 해석·변경 분류용 이전 상태. 없으면 None."""
+        """경로 해석·변경 분류용 이전 상태. 없으면 None.
+
+        P10 — size/md5 도 함께 SELECT 한다. `upsert_item` 은 저장하지만 읽는 쪽이
+        빠뜨려 `_same_remote_content` 의 prev_md5 가 항상 빈 문자열이 되는 구멍을
+        막는다 (설계 §2.1). 기존 4개 키(parent_id/name/remote_path/is_directory)의
+        이름·타입·의미는 불변 — size/md5 만 정규화해 추가한다.
+        """
         cur = self._writer.execute(
-            "SELECT parent_id, name, remote_path, is_directory FROM item WHERE file_id = ?",
+            "SELECT parent_id, name, remote_path, is_directory, size, md5 "
+            "FROM item WHERE file_id = ?",
             (file_id,),
         )
         row = cur.fetchone()
@@ -281,6 +288,8 @@ class Store:
             "name": row[1] or "",
             "remote_path": row[2] or "",
             "is_directory": bool(row[3]),
+            "size": int(row[4] or 0),      # P10 — new
+            "md5": str(row[5] or ""),      # P10 — new
         }
 
     def delete_item(self, file_id: str) -> None:

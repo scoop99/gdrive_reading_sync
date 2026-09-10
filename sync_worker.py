@@ -227,12 +227,39 @@ def _resolve_rel_path(
 
 # ------------------------------------------------------------ 변경 분류 (FF)
 
-def build_change_event(previous: dict | None, current: dict | None) -> dict:
+def _same_remote_content(previous: dict, current: dict) -> bool:
+    """원격 기준 내용 동일 여부. size + md5 만 본다.
+
+    modified_time 은 일부러 제외한다 — Drive 는 내용과 무관한 조작에도 그 값을
+    올리고, 우리 `_event_key` 가 이미 그 값을 포함해 매번 새 job 을 만든다.
+    시그니처에 넣으면 억제가 한 건도 일어나지 않는다 (운영 실측 76,008건 근거).
+
+    md5 가 한쪽이라도 비면 `False` — 업스트림이 `content_signature` 를 truthy
+    검사하는 것과 같은 취지다. Google Docs 류는 md5 가 없으므로 억제 대상이 아니다.
+    """
+    prev_md5 = str(previous.get("md5") or "").strip().lower()
+    cur_md5 = str(current.get("md5") or "").strip().lower()
+    if not prev_md5 or not cur_md5 or prev_md5 != cur_md5:
+        return False
+    return int(previous.get("size") or 0) == int(current.get("size") or 0)
+
+
+# ponytail: 내용 무변경이면 이벤트를 안 만든다. 로컬 파일이 지워졌을 때
+#           EDIT 이 우연히 복구해 주던 경로도 함께 사라진다 — 정식 복구는
+#           F-1 reconcile 소관. 신뢰할 수 없는 부수 효과를 대가로 md5 재계산을 없앤다.
+def build_change_event(
+    previous: dict | None, current: dict | None
+) -> dict | None:
     """이전 상태와 현재 상태를 비교해 action 을 정한다.
 
     FF gdrive_changes.py build_change_event 이식. 판정 순서가 규약이다 —
     delete → create → rename → edit. 뒤집으면 rename 이 create 로 새어 나가
     2단계에서 같은 파일을 한 벌 더 복사하게 된다.
+
+    P10 — 내용 무변경이면 (size·md5 같음, modified_time 무관) edit 을 억제해
+    `None` 을 돌려준다. 억제 게이트는 **edit 바로 앞에만** 두며 다른 자리로
+    옮기지 않는다 (설계 §8). 호출부는 억제된 경우에도 `upsert_item` 을 반드시
+    실행한다 (설계 §3).
     """
     previous = previous or {}
     current = current or {}
@@ -256,6 +283,11 @@ def build_change_event(previous: dict | None, current: dict | None) -> dict:
             "path": new_path,
             "removed_path": old_path,
         }
+    # P10 — 내용 무변경이면 이벤트 없음. 판정 순서(delete→create→rename→edit)는
+    # 그대로 두고 edit 앞에만 게이트를 넣는다. 폴더는 내용 시그니처가 없으므로
+    # 항상 억제한다 (폴더 자체의 create/edit 는 어차피 job 을 만들지 않는다).
+    if item_type == "directory" or _same_remote_content(previous, current):
+        return None
     return {"action": "edit", "item_type": item_type, "path": new_path, "removed_path": ""}
 
 
@@ -331,6 +363,7 @@ def _poll_once_locked(client: DriveClient, store: Store, cfg: dict, log=print) -
         "excluded_skipped": 0,
         "extension_skipped": 0,
         "probe_skipped": 0,
+        "unchanged_skipped": 0,   # P10 — 내용 무변경(size·md5 동일)으로 억제한 edit
         "resolve_errors": 0,
         "by_action": {},
     }
@@ -388,9 +421,11 @@ def _poll_once_locked(client: DriveClient, store: Store, cfg: dict, log=print) -
                         }
 
                 event = build_change_event(previous, current)
-                path = event["path"]
 
                 # item 갱신은 필터보다 먼저. 제외 대상이라도 경로 캐시는 살려 둔다.
+                # (P10 — event 판정보다도 앞선다. 억제된 변경(None)에서도 캐시를
+                #  최신으로 갱신해야 같은 변경이 다음 폴링에 다시 되돌아오지 않는다.
+                #  설계 §3 — 이걸 놓치면 낭비 버그가 무한루프 버그가 된다)
                 if current:
                     store.upsert_item(
                         {
@@ -406,6 +441,13 @@ def _poll_once_locked(client: DriveClient, store: Store, cfg: dict, log=print) -
                     )
                 elif previous:
                     store.delete_item(fid)
+
+                if event is None:
+                    # P10 — 내용 무변경(size·md5 동일) 도달한 파일. job 을 만들지 않는다.
+                    summary["unchanged_skipped"] += 1
+                    continue
+
+                path = event["path"]
 
                 # §4.1 — 디렉터리 처리
                 if event["item_type"] == "directory":
@@ -529,6 +571,7 @@ def _poll_once_locked(client: DriveClient, store: Store, cfg: dict, log=print) -
         f"folders={summary['folders_seen']} "
         f"out_of_root={summary['out_of_root_skipped']} excluded={summary['excluded_skipped']} "
         f"ext_skip={summary['extension_skipped']} probe_skip={summary['probe_skipped']} "
+        f"unchanged_skip={summary['unchanged_skipped']} "
         f"resolve_err={summary['resolve_errors']}"
     )
     return summary
