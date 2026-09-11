@@ -21,12 +21,35 @@ function pickRemoteOptions(remotes, saved) {
   return { options, selected };
 }
 
+/**
+ * 탐색기에서 고른 폴더를 각 설정칸에 넣을 최종 값으로 바꾼다.
+ *
+ * 본체 탐색 API 가 디렉터리만 돌려주므로(browse_routes.py:126) 파일은 고를 수 없다.
+ * RCLONE_BIN / RCLONE_CONFIG 는 파일명이 고정이라 폴더 뒤에 붙여 완성한다.
+ *
+ * @param {string} key    설정 키
+ * @param {string} folder 사용자가 고른 폴더 절대경로
+ * @param {boolean} isWindows 경로 구분자/실행파일명 판단
+ * @returns {string} 입력칸에 넣을 값
+ */
+function resolvePickedPath(key, folder, isWindows) {
+  const dir = String(folder || '').trim().replace(/[\\/]+$/, '');
+  if (!dir) return '';
+  const sep = isWindows ? '\\' : '/';
+  const FILE_BY_KEY = {
+    RCLONE_BIN: isWindows ? 'rclone.exe' : 'rclone',
+    RCLONE_CONFIG: 'rclone.conf',
+  };
+  const fname = FILE_BY_KEY[key];
+  return fname ? `${dir}${sep}${fname}` : dir;
+}
+
 // 테스트용 export (반드시 이 형태). new Function 스코프에는 module 이 없어
 // typeof module 이 'undefined' 로 평가된다 — 단락 평가라 브라우저에서 안전하다.
 // CJS require 로 로드되면 여기서 export 하고 즉시 return 해 아래 DOM 코드가
 // 실행되지 않게 한다 (test_settings_js.js 에서 순수 함수만 테스트한다).
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { pickRemoteOptions };
+  module.exports = { pickRemoteOptions, resolvePickedPath };
   return;
 }
 
@@ -113,6 +136,156 @@ root.querySelectorAll('[data-check]').forEach((button) => {
   if (input) input.addEventListener('input', () => {
     showResult(input === binaryInput ? 'binary' : 'config', '', '');
   });
+});
+
+// ---- P12 — 설정 경로 탐색기 ---------------------------------------------
+// 본체 탐색 API(GET /api/media/browse-paths)를 그대로 호출한다. 권한 검사·허용 루트·
+// 경로 탈출 방지는 본체가 이미 한다(browse_routes.py). 우리는 UI 만 만든다.
+// 본체 모달은 결과를 library-form-path 에 하드코딩하므로 재사용 불가 → 우리 모달을 쓴다.
+const BROWSE_API = '/api/media/browse-paths';
+// 파일명을 자동으로 붙일 설정 키. 본체 API 가 디렉터리만 주므로(browse_routes.py:126)
+// 이 두 칸은 폴더를 고르면 고정 파일명을 뒤에 붙여 완성한다.
+const BROWSE_FILE_KEYS = { RCLONE_BIN: true, RCLONE_CONFIG: true };
+
+const browseModal = root.querySelector('#gdrs-browse-modal');
+const browseList = root.querySelector('#gdrs-browse-list');
+const browseCur = root.querySelector('#gdrs-browse-cur');
+const browsePreview = root.querySelector('#gdrs-browse-preview');
+const browseTitle = root.querySelector('#gdrs-browse-title');
+
+let browseKey = '';    // 지금 탐색 중인 설정 키
+let browsePath = '';   // 현재 폴더 (서버 응답의 currentPath 원문)
+
+// 고른 경로 자체로 OS 를 판정한다. navigator 보다 정확하다 — 서버가 리눅스 도커면
+// 경로가 /mnt/... 로 오므로 platform 보다 경로가 더 신뢰할 만하다 (설계 §2).
+function browseIsWindows(p) {
+  const s = String(p || '');
+  return /^[A-Za-z]:/.test(s) || s.includes('\\');
+}
+
+// 파일칸이면 파일명을 떼고 상위 폴더에서 시작한다. 폴더칸이면 입력값 그대로. 비면 루트.
+function browseStartPath(key, value) {
+  const v = String(value || '').trim();
+  if (!v) return '';
+  if (BROWSE_FILE_KEYS[key]) {
+    const i = Math.max(v.lastIndexOf('/'), v.lastIndexOf('\\'));
+    return i > 0 ? v.slice(0, i) : '';
+  }
+  return v;
+}
+
+// 확정 시 입력칸에 들어갈 최종 값을 미리 보여준다 — 파일칸이면 파일명이 붙는 걸 눈으로
+// 확인시켜 "왜 파일이 안 보이지?" 를 원천 차단한다 (설계 §3.3).
+function browseRenderPreview() {
+  if (!browsePreview) return;
+  if (!browsePath) {
+    browsePreview.textContent = '';
+    return;
+  }
+  const finalValue = resolvePickedPath(browseKey, browsePath, browseIsWindows(browsePath));
+  browsePreview.textContent = finalValue ? `선택하면 입력칸에 들어갈 값: ${finalValue}` : '';
+}
+
+function browseRenderError(message) {
+  if (!browseList) return;
+  browseList.replaceChildren();
+  const div = document.createElement('div');
+  div.className = 'gdrs-browse-error';
+  div.textContent = message || '목록을 불러오지 못했습니다.';
+  browseList.appendChild(div);
+}
+
+async function browse(path) {
+  if (!browseList) return;
+  browseList.textContent = '불러오는 중…';
+  try {
+    const url = `${BROWSE_API}?path=${encodeURIComponent(path || '')}`;
+    const resp = await fetch(url, { credentials: 'same-origin' });
+    const data = await resp.json().catch(() => ({ success: false, error: `HTTP ${resp.status}` }));
+    if (!data.success) {
+      // 본체 API 실패를 조용히 삼키지 않는다 — 403(허용 루트 밖) 등은 사용자가 알아야 조치한다.
+      browsePath = '';
+      if (browseCur) browseCur.textContent = '–';
+      browseRenderError(data.error || `HTTP ${resp.status}`);
+      browseRenderPreview();
+      return;
+    }
+    browsePath = data.currentPath || '';
+    if (browseCur) browseCur.textContent = browsePath || '(드라이브 루트)';
+    browseList.replaceChildren();
+    const items = Array.isArray(data.items) ? data.items : [];
+    if (!items.length) {
+      const div = document.createElement('div');
+      div.className = 'gdrs-browse-empty';
+      div.textContent = '하위 폴더가 없습니다. [이 폴더 선택] 을 누르세요.';
+      browseList.appendChild(div);
+    } else {
+      items.forEach((item) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'gdrs-browse-item';
+        btn.textContent = item.name;
+        btn.addEventListener('click', () => browse(item.path));
+        browseList.appendChild(btn);
+      });
+    }
+    browseRenderPreview();
+  } catch (error) {
+    browsePath = '';
+    browseRenderError(`탐색 실패 · ${error.message || error}`);
+    browseRenderPreview();
+  }
+}
+
+function openBrowse(key) {
+  const input = field(key);
+  browseKey = key;
+  if (browseTitle) {
+    browseTitle.textContent = BROWSE_FILE_KEYS[key]
+      ? '폴더 선택 — 파일명이 자동으로 붙습니다'
+      : '폴더 선택';
+  }
+  if (browseModal) browseModal.hidden = false;
+  browse(browseStartPath(key, input ? input.value : ''));
+}
+
+function closeBrowse() {
+  if (browseModal) browseModal.hidden = true;
+  browseKey = '';
+  browsePath = '';
+}
+
+function acceptBrowse() {
+  if (!browseKey) {
+    closeBrowse();
+    return;
+  }
+  const input = field(browseKey);
+  if (input && browsePath) {
+    input.value = resolvePickedPath(browseKey, browsePath, browseIsWindows(browsePath));
+    // input 이벤트를 dispatch 해 기존 checkRclone 결과 표시를 초기화한다 (설계 §4).
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  closeBrowse();
+}
+
+root.querySelectorAll('[data-browse]').forEach((button) => {
+  button.addEventListener('click', () => openBrowse(button.dataset.browse));
+});
+const browseClose = root.querySelector('#gdrs-browse-close');
+const browseCancel = root.querySelector('#gdrs-browse-cancel');
+const browseOk = root.querySelector('#gdrs-browse-ok');
+if (browseClose) browseClose.addEventListener('click', closeBrowse);
+if (browseCancel) browseCancel.addEventListener('click', closeBrowse);
+if (browseOk) browseOk.addEventListener('click', acceptBrowse);
+if (browseModal) {
+  // 배경(모달 자신) 클릭 시 취소 — 입력칸은 그대로.
+  browseModal.addEventListener('click', (ev) => {
+    if (ev.target === browseModal) closeBrowse();
+  });
+}
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && browseModal && !browseModal.hidden) closeBrowse();
 });
 
 // P11 — 초기화 두 단계.

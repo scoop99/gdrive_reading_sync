@@ -8,6 +8,35 @@
 
 ---
 
+## [0.3.9] — 2026-09-11
+
+### 추가
+- **설정 화면의 경로 칸에 `찾아보기` 버튼.** 이제 경로를 타이핑하지 않고 클릭으로
+  고를 수 있습니다. 대상: `로컬 루트`(`LOCAL_ROOT`), `임시 폴더`(`TMP_ROOT`),
+  `로그 디렉터리`(`LOG_DIR`), `rclone 실행 파일`(`RCLONE_BIN`),
+  `rclone 설정 파일`(`RCLONE_CONFIG`) 다섯 칸.
+
+  **탐색기는 폴더만 선택됩니다.** BookOasis 경로 탐색 API
+  (`/api/media/browse-paths`)가 **디렉터리만 돌려주기** 때문이며(본체
+  `api/routes/browse_routes.py:126`), 본체 코드는 플러그인이 고칠 수 없습니다.
+  파일명이 정해진 두 칸(`RCLONE_BIN`/`RCLONE_CONFIG`)은 **폴더를 고르면 파일명이
+  자동으로 붙습니다** — `rclone.exe`(Windows) / `rclone`(그 외), `rclone.conf`.
+  다른 파일명을 쓰면 직접 입력하세요.
+
+  이 사실을 화면에 **눈에 보이는 텍스트로** 안내합니다(툴팁 아님) — 두 파일칸의
+  도움말, 탐색기 상단 안내줄, 그리고 확정 전 미리보기(`선택하면 입력칸에 들어갈 값: …`).
+
+### 참고
+- 권한 검사·허용 루트 제한·경로 탈출 방지는 **본체가 이미 하는 것을 그대로** 씁니다
+  (`BROWSE_ALLOWED_ROOTS`, `@admin_required`). 플러그인은 UI 만 만듭니다.
+- 본체 탐색기(`window.openPathBrowser`)는 재사용하지 않았습니다 — 결과를
+  `library-form-path` 에 하드코딩하고(`path_browser.js:293`), 여러 경로를 누적하며,
+  모달 DOM 이 보관함 모달 템플릿에만 있습니다.
+- `resolvePickedPath()` 순수 함수 + `test_settings_js.js` 9케이스 추가(총 16케이스).
+- 탐색을 취소(취소·✕·배경 클릭·ESC)하면 기존 입력값은 그대로입니다.
+
+---
+
 ## [0.3.8] — 2026-09-10
 
 ### 변경

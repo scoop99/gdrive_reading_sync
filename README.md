@@ -188,6 +188,12 @@ rclone --config <conf경로> config reconnect myremote:
 
 환경설정 → 플러그인 → 구드 독서 동기화.
 
+> **경로 칸은 `찾아보기` 버튼으로 고를 수 있습니다.** 탐색기는 **폴더만** 선택합니다
+> (BookOasis 탐색 API 가 디렉터리만 돌려줍니다). `rclone 실행 파일` / `rclone 설정 파일`
+> 두 칸은 파일명이 정해져 있어 **폴더를 고르면 파일명이 자동으로 붙습니다**
+> (`rclone.exe`(Windows) / `rclone`(그 외), `rclone.conf`). 다른 파일명을 쓰면 직접
+> 입력하세요. 탐색기를 취소하면 기존 입력값은 그대로입니다.
+
 | 키 | 설명 |
 |---|---|
 | `ENABLE_SYNC` | 동기화 활성화 (기본 꺼짐) |
@@ -251,7 +257,7 @@ POST /api/webhook/gdrive_reading_sync/rclone-check
 
 ```bash
 python test_sync_worker.py     # 오프라인 회귀 93종. 네트워크·BookOasis 불필요
-node test_settings_js.js       # 설정 화면 순수 함수 회귀 7케이스
+node test_settings_js.js       # 설정 화면 순수 함수 회귀 16케이스
 node test_script_js.js         # 진행률 계산 순수 함수 회귀 7케이스
 ```
 
