@@ -8,6 +8,31 @@
 
 ---
 
+## [0.3.10] — 2026-09-11
+
+### 고침
+- **플러그인 게시판 설치가 막히던 문제.** 게시판이
+  `플러그인 검증 실패 — 필수 필드: 클래스에 없음: name` 으로 설치를 거부했습니다.
+
+  원인: 게시판은 소스를 **AST 로 정적 검사**하며, `name` 이 **리터럴 문자열**일 때만
+  필수 필드로 인정합니다(`plugin_board.py:1641`). 0.3.5 에서 버전을 붙이려고
+  `name = "구드 독서 동기화" + _VER_SUFFIX` 로 바꾼 것이 `ast.Constant` 가 아니어서
+  인식되지 않았습니다. 런타임에는 정상 동작하므로 설치를 시도하기 전까지 드러나지 않습니다.
+
+  `name` 을 리터럴로 되돌렸습니다. **화면 표시는 달라지지 않습니다** — 페이지 제목의
+  버전은 `/status` 의 `plugin_version` 을 읽어 붙이는 별도 경로이며 그대로입니다.
+  플러그인 관리 목록의 이름에서만 버전이 빠집니다.
+
+### 참고
+- 같은 함정에 두 번 걸렸습니다(0.3.2 `config_schema`, 0.3.5 `name`). 재발을 막으려고
+  게시판 검증 로직을 그대로 재현한 회귀 테스트를 넣었습니다
+  (`test_sync_worker.py::test_T_BOARD_required_fields_are_ast_literals`).
+  `id`/`name`/`is_searchable`/`config_schema`/`category_tab`/`update_manifest` 가
+  모두 게시판이 요구하는 리터럴 형태인지 AST 로 검사합니다. 총 94종.
+- **f-string, `+` 연결, `%` 포맷, 변수 참조는 전부 안 됩니다. 리터럴만 됩니다.**
+
+---
+
 ## [0.3.9] — 2026-09-11
 
 ### 추가
@@ -166,6 +191,8 @@
 
 ---
 
+[0.3.10]: https://github.com/scoop99/gdrive_reading_sync/releases/tag/v0.3.10
+[0.3.9]: https://github.com/scoop99/gdrive_reading_sync/releases/tag/v0.3.9
 [0.3.8]: https://github.com/scoop99/gdrive_reading_sync/releases/tag/v0.3.8
 [0.3.7]: https://github.com/scoop99/gdrive_reading_sync/releases/tag/v0.3.7
 [0.3.6]: https://github.com/scoop99/gdrive_reading_sync/releases/tag/v0.3.6

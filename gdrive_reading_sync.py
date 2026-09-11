@@ -52,7 +52,6 @@ def _plugin_version() -> str:
 
 # import 시점 1회. 화면 제목과 /status 응답에 실제 설치 버전을 노출한다.
 PLUGIN_VERSION = _plugin_version()
-_VER_SUFFIX = f" v{PLUGIN_VERSION}" if PLUGIN_VERSION else ""
 
 # 자동 스캔이 라이브러리를 찾을 세션 (local_folder_watch 샘플 플러그인과 동일)
 _WATCHED_SESSIONS = ("general", "adult", "audiobook", "video")
@@ -178,7 +177,13 @@ _ROUTES_LOCK = threading.Lock()
 
 class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
     id = "gdrive_reading_sync"
-    name = "구드 독서 동기화" + _VER_SUFFIX
+    # 게시판 설치 검증(plugin_board.py:1641)은 `name` 이 **리터럴 문자열**일 때만
+    # 필수 필드로 인정한다. f-string / `+` 연결 / 변수 참조는 ast.Constant 가 아니라서
+    # '필수 필드: 클래스에 없음: name' 으로 설치가 막힌다.
+    # v0.3.5 에서 실제로 막혔다 (v0.3.2 의 config_schema 와 같은 함정).
+    # 버전 표시는 /status 의 plugin_version -> script.js 경로로만 한다.
+    # 이 줄을 리터럴이 아닌 형태로 바꾸지 마라 — T-BOARD 회귀가 막는다.
+    name = "구드 독서 동기화"
     is_searchable = False
     category_tab = {
         "title": "구드 동기화",   # P11 — 사이드 메뉴 탭에는 버전을 붙이지 않는다 (v0.3.7)

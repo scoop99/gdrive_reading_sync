@@ -3291,6 +3291,77 @@ def test_T_P10_9_get_item_roundtrip_size_md5():
     print("  OK T-P10-9 get_item size/md5 왕복 대칭 (NULL 정규화 포함)")
 
 
+
+# ---- T-BOARD 게시판 설치 검증 (AST) --------------------------------------
+
+def test_T_BOARD_required_fields_are_ast_literals():
+    """플러그인 게시판의 정적 검증을 **그대로 재현**해 설치가 막히지 않는지 본다.
+
+    게시판(`plugin_board.py:1632-1651`)은 AST 로만 검사한다. 런타임에 값이 잘
+    만들어져도 소용없고, 아래 **리터럴 형태**여야만 필수 필드로 인정한다:
+
+        id             ast.Constant(str)
+        name           ast.Constant(str)
+        is_searchable  ast.Constant(bool)
+        config_schema  ast.List / ast.Tuple
+        category_tab / update_manifest / dashboard_widget   ast.Dict
+
+    실제로 두 번 막혔다:
+      - v0.3.2 `config_schema: list = _BASE` (어노테이션 + 이름 참조)
+      - v0.3.5 `name = "..." + _VER_SUFFIX` (BinOp)
+    둘 다 "필수 필드: 클래스에 없음" 으로 설치가 중단됐다. 그래서 이 테스트가 있다.
+    **f-string, + 연결, % 포맷, 변수 참조 전부 안 된다. 리터럴만 된다.**
+    """
+    import ast as _ast
+    path = Path(__file__).resolve().parent / "gdrive_reading_sync.py"
+    tree = _ast.parse(path.read_text(encoding="utf-8"))
+
+    cls = None
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.ClassDef) and node.name == "GdriveReadingSyncMetadataProvider":
+            cls = node
+            break
+    assert cls is not None, "provider 클래스를 찾지 못했다"
+
+    found = {}
+    for stmt in cls.body:
+        if not isinstance(stmt, (_ast.Assign, _ast.AnnAssign)):
+            continue
+        targets = stmt.targets if isinstance(stmt, _ast.Assign) else [stmt.target]
+        for t in targets:
+            if not isinstance(t, _ast.Name):
+                continue
+            val = stmt.value
+            # 게시판과 동일한 판정
+            if t.id == "id" and isinstance(val, _ast.Constant) and isinstance(val.value, str):
+                found["id"] = val.value
+            elif t.id == "name" and isinstance(val, _ast.Constant) and isinstance(val.value, str):
+                found["name"] = val.value
+            elif t.id == "is_searchable" and isinstance(val, _ast.Constant) and isinstance(val.value, bool):
+                found["is_searchable"] = val.value
+            elif t.id == "config_schema" and isinstance(val, (_ast.List, _ast.Tuple)):
+                found["config_schema"] = True
+            elif t.id in ("category_tab", "update_manifest") and isinstance(val, _ast.Dict):
+                found[t.id] = True
+
+    missing = [f for f in ("name", "is_searchable", "config_schema") if f not in found]
+    assert not missing, (
+        f"게시판 설치가 막힌다 — 필수 필드가 리터럴이 아니다: {missing}. "
+        "f-string / + 연결 / 변수 참조를 쓰지 말고 리터럴로 두어라."
+    )
+    # id 는 폴더명·모듈명과 같아야 목록에 뜬다
+    assert found.get("id") == "gdrive_reading_sync", found.get("id")
+    # 선택 필드도 리터럴 dict 여야 게시판이 인정한다
+    assert "category_tab" in found, "category_tab 이 리터럴 dict 가 아니다"
+    assert "update_manifest" in found, "update_manifest 가 리터럴 dict 가 아니다"
+    # search / apply 메서드 존재
+    methods = {n.name for n in cls.body if isinstance(n, _ast.FunctionDef)}
+    for m in ("search", "apply"):
+        assert m in methods, f"필수 메서드 없음: {m}"
+
+    print("  OK T-BOARD 게시판 필수 필드 AST 리터럴 (name/is_searchable/config_schema + id/tab/manifest)")
+
+
 if __name__ == "__main__":
     tests = [
         # 기존 6종 (1라운드 회귀)
@@ -3378,6 +3449,8 @@ if __name__ == "__main__":
         test_T_P7_P5_executor_only_receives_copy_jobs,
         test_T_P7_P6_no_direct_writer_execute_in_sync_worker,
         test_T_P7_SYM_T2_PARALLEL_copy_concurrent_speedup,
+        # 게시판 설치 검증 회귀 (v0.3.2 · v0.3.5 에서 두 번 막혔다)
+        test_T_BOARD_required_fields_are_ast_literals,
         # T3 — 자동 스캔 (v0.3.4 — 폴더 단위 부분 스캔) 신규
         test_T_AS1_pick_library_deepest_match,
         test_T_AS2_landed_dirs_only_for_real_disk_change,
