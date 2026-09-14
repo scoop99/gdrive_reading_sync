@@ -36,6 +36,14 @@ MAX_DEPTH = 30
 # READING 밖 변경이 압도적으로 많다(실측 709건 중 675건). 이 표식이 없으면
 # 형제 파일마다 같은 조상 체인을 My Drive 루트까지 되짚는다.
 _OUTSIDE = object()
+# 조용한 폴링을 접기 위한 상태. 백필이 끝나면 대부분의 사이클이 "아무 일도 없음"
+# 인데(2026-09-14 실측: 하루 1,171줄 중 1,097줄 93.7%가 전부 0), 그걸 매번 찍으면
+# 정작 의미 있는 줄이 0 사이에 묻힌다. 그렇다고 통째로 없애면 폴링 생존을 확인할
+# 방법이 사라진다 — 실제로 "마지막 수신이 나흘 전인데 맞냐" 를 이 로그로 판단했다.
+# 그래서 조용한 사이클은 세어 두었다가 1시간에 한 줄로 접어서 남긴다.
+_IDLE_LOG_INTERVAL = 3600.0
+_IDLE = {"cycles": 0, "last_log": 0.0,
+         "changes": 0, "out_of_root": 0, "excluded": 0, "ext_skip": 0, "probe_skip": 0}
 # poll_once 는 sync_state.page_token 을 읽고→소비하고→쓴다. 백그라운드 루프와
 # POST /backfill 이 같은 store 에 동시에 들어가면 같은 change 를 두 번 처리해
 # 두 번째가 create 를 edit 으로 뒤집는다 (실측: edit 11건 유령 행).
@@ -331,6 +339,26 @@ def poll_once(client: DriveClient, store: Store, cfg: dict, log=print) -> dict:
         return _poll_once_locked(client, store, cfg, log)
 
 
+def _flush_idle(log, page_token: str) -> None:
+    """모아둔 조용한 사이클을 한 줄로 접어 남기고 카운터를 비운다.
+
+    `page_token` 을 함께 찍는 이유: 이 값이 전진하면 Drive 가 변경을 계속
+    돌려주고 있다는 뜻이라, 줄 하나로 "살아 있음 + 전진 중" 이 동시에 확인된다.
+    """
+    if not _IDLE["cycles"]:
+        return
+    log(
+        f"[gdrive_reading_sync] poll idle {_IDLE['cycles']} cycles "
+        f"changes={_IDLE['changes']} (전부 대상 밖: "
+        f"out_of_root={_IDLE['out_of_root']} excluded={_IDLE['excluded']} "
+        f"ext_skip={_IDLE['ext_skip']} probe_skip={_IDLE['probe_skip']}) "
+        f"token={page_token or '-'}"
+    )
+    _IDLE["cycles"] = 0
+    for k in ("changes", "out_of_root", "excluded", "ext_skip", "probe_skip"):
+        _IDLE[k] = 0
+
+
 def _poll_once_locked(client: DriveClient, store: Store, cfg: dict, log=print) -> dict:
     root_id = (cfg.get("REMOTE_ROOT_FOLDER_ID") or "").strip()
     if not root_id:
@@ -565,15 +593,48 @@ def _poll_once_locked(client: DriveClient, store: Store, cfg: dict, log=print) -
     # 특히 folders_seen 은 폴더 rename 전파(S2)의 유일한 관측 창구다 — 실제 폴더
     # 이벤트가 지나가도 로그에 흔적이 없으면 놓치면 영영 모른다 (2026-09-03 소킹에서
     # 잔여 17건의 정체를 로그로 못 밝히고 DB 를 뒤져야 했다).
-    log(
-        f"[gdrive_reading_sync] poll pages={pages} changes={summary['changes_seen']} "
-        f"jobs={summary['jobs_created']} {summary['by_action']} "
-        f"folders={summary['folders_seen']} "
-        f"out_of_root={summary['out_of_root_skipped']} excluded={summary['excluded_skipped']} "
-        f"ext_skip={summary['extension_skipped']} probe_skip={summary['probe_skipped']} "
-        f"unchanged_skip={summary['unchanged_skipped']} "
-        f"resolve_err={summary['resolve_errors']}"
+    def _emit_full():
+        log(
+            f"[gdrive_reading_sync] poll pages={pages} changes={summary['changes_seen']} "
+            f"jobs={summary['jobs_created']} {summary['by_action']} "
+            f"folders={summary['folders_seen']} "
+            f"out_of_root={summary['out_of_root_skipped']} excluded={summary['excluded_skipped']} "
+            f"ext_skip={summary['extension_skipped']} probe_skip={summary['probe_skipped']} "
+            f"unchanged_skip={summary['unchanged_skipped']} "
+            f"resolve_err={summary['resolve_errors']}"
+        )
+
+    # 실제로 뭔가 일어난 사이클인가. job 생성·폴더 이벤트·무변경 억제·해석 오류는
+    # 전부 사람이 봐야 하는 사건이다. 실패(ok=False)도 당연히 남긴다.
+    # 반면 out_of_root / excluded / ext_skip / probe_skip 만 있는 사이클은 "대상 밖"
+    # 이라 매번 찍을 가치가 없다 — 아래 idle 요약에 합산해 남긴다.
+    actionable = (
+        not summary.get("ok", True)
+        or summary["jobs_created"]
+        or summary["folders_seen"]
+        or summary["unchanged_skipped"]
+        or summary["resolve_errors"]
     )
+
+    if actionable:
+        # 밀린 조용한 사이클이 있으면 먼저 한 줄로 접어 남기고, 그다음 본 줄을 찍는다.
+        # 순서를 지켜야 "조용하다가 언제부터 일이 생겼는지" 가 로그에서 읽힌다.
+        if _IDLE["cycles"]:
+            _flush_idle(log, summary["page_token"])
+        _emit_full()
+        return summary
+
+    # 조용한 사이클 — 세어 두기만 한다.
+    now = time.monotonic()
+    _IDLE["cycles"] += 1
+    _IDLE["changes"] += summary["changes_seen"]
+    _IDLE["out_of_root"] += summary["out_of_root_skipped"]
+    _IDLE["excluded"] += summary["excluded_skipped"]
+    _IDLE["ext_skip"] += summary["extension_skipped"]
+    _IDLE["probe_skip"] += summary["probe_skipped"]
+    if now - _IDLE["last_log"] >= _IDLE_LOG_INTERVAL:
+        _IDLE["last_log"] = now
+        _flush_idle(log, summary["page_token"])
     return summary
 
 

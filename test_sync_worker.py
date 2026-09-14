@@ -3362,6 +3362,89 @@ def test_T_BOARD_required_fields_are_ast_literals():
     print("  OK T-BOARD 게시판 필수 필드 AST 리터럴 (name/is_searchable/config_schema + id/tab/manifest)")
 
 
+
+# ---- T-IDLE 조용한 폴링 로그 접기 -----------------------------------------
+
+def _reset_idle():
+    from plugins.metadata.gdrive_reading_sync import sync_worker as _sw
+    _sw._IDLE.update({"cycles": 0, "last_log": 0.0, "changes": 0,
+                      "out_of_root": 0, "excluded": 0, "ext_skip": 0, "probe_skip": 0})
+    return _sw
+
+
+def test_T_IDLE_quiet_polls_collapse_but_events_always_logged():
+    """조용한 사이클은 접고, 사건이 있는 사이클은 반드시 남긴다.
+
+    백필 종료 후 하루 1,171줄 중 1,097줄(93.7%)이 전부 0 이었다. 그걸 매번 찍으면
+    의미 있는 줄이 묻힌다. 그렇다고 없애면 폴링 생존 확인이 불가능해진다 —
+    실제로 "마지막 수신이 나흘 전인데 맞냐" 를 이 로그로 판단했다.
+
+    계약:
+      - 아무 일도 없는 사이클: `poll pages=` 줄을 찍지 않는다
+      - 첫 조용한 사이클 1건은 즉시 idle 요약으로 남긴다(생존 증거 확보)
+      - 그 뒤 1시간 동안은 조용해도 침묵
+      - job 이 생기면 밀린 idle 을 먼저 접어 남기고 본 줄을 찍는다
+    """
+    sw = _reset_idle()
+
+    # (1) 조용한 폴링 — 루트 밖 변경만
+    logs = []
+    store = _store()
+    client = FakeClient([{"changes": [], "newStartPageToken": "7387301"}])
+    poll_once(client, store, CFG, log=logs.append)
+    assert not [l for l in logs if "poll pages=" in l], "조용한데 전체 줄을 찍었다: %s" % logs
+    idle = [l for l in logs if "poll idle" in l]
+    assert idle, "첫 조용한 사이클은 생존 증거로 남아야 한다: %s" % logs
+    assert "token=" in idle[0], idle[0]
+
+    # (2) 이어지는 조용한 사이클 — 1시간 안이므로 침묵
+    logs2 = []
+    for _ in range(3):
+        client = FakeClient([{"changes": [], "newStartPageToken": "7387302"}])
+        poll_once(client, store, CFG, log=logs2.append)
+    assert not logs2, "1시간 안의 조용한 사이클은 침묵해야 한다: %s" % logs2
+    assert sw._IDLE["cycles"] == 3, sw._IDLE
+
+    # (3) 사건 발생 — 밀린 idle 을 먼저 접고 본 줄을 찍는다
+    logs3 = []
+    client = FakeClient([{
+        "changes": [{"fileId": "x9", "file": _file("x9", "SPARK 2019.01#101.pdf", "f_spark")}],
+        "newStartPageToken": "7387303",
+    }])
+    poll_once(client, store, CFG, log=logs3.append)
+    full = [i for i, l in enumerate(logs3) if "poll pages=" in l]
+    flush = [i for i, l in enumerate(logs3) if "poll idle" in l]
+    assert full, "사건이 있는데 본 줄이 없다: %s" % logs3
+    assert flush, "밀린 idle 이 접혀 남지 않았다: %s" % logs3
+    assert flush[0] < full[0], "idle 요약이 본 줄보다 먼저 와야 한다: %s" % logs3
+    assert sw._IDLE["cycles"] == 0, "사건 후 idle 카운터가 비워지지 않았다"
+
+    _reset_idle()
+    print("  OK T-IDLE 조용하면 접고 사건은 반드시 남긴다 (첫 1건 즉시 · 이후 1시간)")
+
+
+def test_T_IDLE_error_cycle_is_never_collapsed():
+    """실패한 사이클은 조용해 보여도 절대 접지 않는다."""
+    sw = _reset_idle()
+    sw._IDLE["last_log"] = 10 ** 9   # 첫 idle 출력도 억제해 대비를 분명히 한다
+
+    logs = []
+    store = _store()
+
+    class _Boom:
+        def start_page_token(self):
+            return "7387300"
+
+        def list_changes(self, *a, **k):
+            raise DriveAPIError("boom 403")
+
+    poll_once(_Boom(), store, CFG, log=logs.append)
+    assert [l for l in logs if "poll error" in l], "오류 줄이 없다: %s" % logs
+    assert sw._IDLE["cycles"] == 0, "오류 사이클을 idle 로 셌다"
+    _reset_idle()
+    print("  OK T-IDLE 오류 사이클은 접지 않는다")
+
+
 if __name__ == "__main__":
     tests = [
         # 기존 6종 (1라운드 회귀)
@@ -3451,6 +3534,9 @@ if __name__ == "__main__":
         test_T_P7_SYM_T2_PARALLEL_copy_concurrent_speedup,
         # 게시판 설치 검증 회귀 (v0.3.2 · v0.3.5 에서 두 번 막혔다)
         test_T_BOARD_required_fields_are_ast_literals,
+        # 조용한 폴링 로그 접기 (하루 1,100줄 노이즈 제거)
+        test_T_IDLE_quiet_polls_collapse_but_events_always_logged,
+        test_T_IDLE_error_cycle_is_never_collapsed,
         # T3 — 자동 스캔 (v0.3.4 — 폴더 단위 부분 스캔) 신규
         test_T_AS1_pick_library_deepest_match,
         test_T_AS2_landed_dirs_only_for_real_disk_change,
