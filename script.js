@@ -36,10 +36,21 @@
     return tab === "orphans" ? "orphans" : DEFAULT_TAB;
   }
 
+  // P14 §3.6 — 옛 크기 → 새 크기 차이. 판단의 핵심(화질 개선인지). 부호는 ASCII.
+  // 후보가 없으면(0/비수치) `—`, 차이가 0 이면 `0`. fmtBytes 와 같은 1024 단위.
+  function formatSizeDelta(oldSize, newSize) {
+    const a = Number(oldSize);
+    const b = Number(newSize);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) return "—";
+    const diff = b - a;
+    if (diff === 0) return "0";
+    return (diff > 0 ? "+" : "-") + fmtBytes(Math.abs(diff));
+  }
+
   // 테스트용 export. new Function / 브라우저 스코프에는 module 이 없어
   // typeof 검사에서 단락 평가된다 (settings.js 와 같은 형태).
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { computeProgress, normalizeTab, DEFAULT_TAB };
+    module.exports = { computeProgress, normalizeTab, DEFAULT_TAB, formatSizeDelta };
     return;
   }
 
@@ -72,7 +83,7 @@
     // P13 — 하위 탭 + 정리 대기(고아) 큐 상태
     tab: DEFAULT_TAB,
     orphanPage: 1,
-    orphanPageSize: 100,
+    orphanPageSize: 50,   // P14 §3.6 — 폴더 페이지 크기 (26 폴더가 한 화면)
     orphanClass: "",
     orphanStatus: "",
     orphanSearch: "",
@@ -80,6 +91,10 @@
     orphanPages: 0,
     orphanTotal: 0,
     orphanSelected: new Set(),
+    orphanOpen: new Set(),   // P14 — 펼친 폴더(parent_dir) 집합
+    orphanData: null,        // P14 — 마지막 /orphans 응답 (재렌더용)
+    orphanAutoOpened: false, // P14 — folder_total==1 자동 펼침 1회 가드
+    orphanFolderTotal: 0,
   };
 
   const STATUS_LABEL = {
@@ -680,7 +695,237 @@
     }
   }
 
-  // ---- P13 — 정리 대기(고아) 탭 ------------------------------------------
+  // ---- P13/P14 — 정리 대기(고아) 탭 ---------------------------------------
+
+  function basenameOf(p) {
+    const s = String(p || "");
+    const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+    return i >= 0 ? s.slice(i + 1) : s;
+  }
+
+  function orphanNameCell(text, title) {
+    const td = document.createElement("td");
+    td.className = "gdrs-name-cell";
+    td.textContent = text == null ? "" : String(text);
+    if (title) td.title = title;
+    return td;
+  }
+
+  // 펼친 표의 한 행 — 7열: 체크 · 등급 · 옛 파일 · 옛 크기 · 새 파일 · 새 크기 · 차이.
+  function orphanRowTr(r) {
+    const tr = document.createElement("tr");
+    tr.className = "gdrs-orphan-item-row";
+    // 체크 — pending 이고 class B/C 만.
+    const checkTd = document.createElement("td");
+    checkTd.className = "gdrs-col-check";
+    const selectable = r.status === "pending" && (r.class === "B" || r.class === "C");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.disabled = !selectable;
+    cb.checked = state.orphanSelected.has(r.id);
+    cb.dataset.orphanId = r.id;
+    cb.addEventListener("change", () => {
+      if (cb.checked) state.orphanSelected.add(r.id);
+      else state.orphanSelected.delete(r.id);
+      syncOrphanButtons();
+    });
+    checkTd.appendChild(cb);
+    tr.appendChild(checkTd);
+    // 등급 (+ pending 이 아닐 때만 상태를 작은 글자로 — 기본 필터에선 안 보인다)
+    const classTd = document.createElement("td");
+    classTd.className = "gdrs-orphan-col-class";
+    const badge = document.createElement("span");
+    badge.className = `gdrs-orphan-badge gdrs-orphan-class-${r.class || "none"}`;
+    badge.textContent = ORPHAN_CLASS_LABEL[r.class] || r.class || "-";
+    classTd.appendChild(badge);
+    if (r.status && r.status !== "pending") {
+      const st = document.createElement("div");
+      st.className = "gdrs-orphan-status-inline";
+      st.textContent = ORPHAN_STATUS_LABEL[r.status] || r.status;
+      classTd.appendChild(st);
+    }
+    tr.appendChild(classTd);
+    // 옛 파일 (basename, 줄바꿈 허용 — 전체 경로는 폴더 헤더가 보여준다)
+    tr.appendChild(orphanNameCell(r.name || basenameOf(r.local_path), r.local_path || ""));
+    // 옛 크기
+    tr.appendChild(cell(fmtBytes(r.size), "gdrs-size-cell", String(r.size || 0)));
+    // 새 파일 — 1순위 대조 basename. 없으면 이유를 보이는 글자로 (툴팁 아님).
+    const candSize = Number(r.candidate_size || 0);
+    let newTd;
+    if (r.twin_path) {
+      newTd = orphanNameCell(basenameOf(r.twin_path), r.twin_path);
+    } else {
+      newTd = document.createElement("td");
+      newTd.className = "gdrs-name-cell gdrs-muted-cell";
+      newTd.textContent = (r.candidate_reason === "sibling_only")
+        ? "다른 고아와만 유사" : "대체 없음";
+    }
+    const cands = Array.isArray(r.candidates) ? r.candidates : [];
+    if (cands.length > 1) {
+      const more = document.createElement("div");
+      more.className = "gdrs-orphan-more";
+      more.textContent = `외 ${cands.length - 1}개: ${cands.slice(1).map((c) => c.name).join(", ")}`;
+      newTd.appendChild(more);
+    }
+    tr.appendChild(newTd);
+    // 새 크기 (없으면 —, fmtBytes(0)='-' 와 혼동 금지)
+    tr.appendChild(cell(candSize > 0 ? fmtBytes(candSize) : "—", "gdrs-size-cell"));
+    // 차이 — 판단의 핵심
+    const dTd = document.createElement("td");
+    dTd.className = "gdrs-orphan-col-delta gdrs-size-cell";
+    dTd.textContent = formatSizeDelta(r.size, candSize);
+    tr.appendChild(dTd);
+    return tr;
+  }
+
+  function orphanOthersTr(folder) {
+    const others = Array.isArray(folder.others) ? folder.others : [];
+    const more = Number(folder.others_more || 0);
+    const tr = document.createElement("tr");
+    tr.className = "gdrs-orphan-others-row";
+    const td = document.createElement("td");
+    td.colSpan = 7;
+    const head = document.createElement("div");
+    head.className = "gdrs-orphan-others-head";
+    head.textContent = `이 폴더에 고아가 아닌 파일 ${others.length + more}개`;
+    td.appendChild(head);
+    const list = document.createElement("div");
+    list.className = "gdrs-orphan-others-list";
+    list.textContent = others.length
+      ? others.map((o) => `${o.name} · ${fmtBytes(o.size)}`).join("    ")
+      : "없음";
+    if (more) list.textContent += `    … 외 ${more}개`;
+    td.appendChild(list);
+    tr.appendChild(td);
+    return tr;
+  }
+
+  function orphanFolderTr(folder) {
+    const pdir = folder.parent_dir || "";
+    const open = state.orphanOpen.has(pdir);
+    const ids = Array.isArray(folder.pending_ids) ? folder.pending_ids : [];
+    const counts = folder.counts || {};
+    const tr = document.createElement("tr");
+    tr.className = "gdrs-orphan-folder-row";
+    const td = document.createElement("td");
+    td.colSpan = 7;
+    const box = document.createElement("div");
+    box.className = "gdrs-orphan-folder";
+
+    const head = document.createElement("div");
+    head.className = "gdrs-orphan-folder-head";
+
+    const tog = document.createElement("button");
+    tog.type = "button";
+    tog.className = "gdrs-orphan-toggle";
+    tog.textContent = open ? "▾" : "▸";
+    tog.addEventListener("click", () => {
+      if (state.orphanOpen.has(pdir)) state.orphanOpen.delete(pdir);
+      else state.orphanOpen.add(pdir);
+      renderOrphansView();
+    });
+    head.appendChild(tog);
+
+    const fcb = document.createElement("input");
+    fcb.type = "checkbox";
+    fcb.disabled = ids.length === 0;
+    fcb.checked = ids.length > 0 && ids.every((id) => state.orphanSelected.has(id));
+    fcb.addEventListener("change", () => {
+      ids.forEach((id) => {
+        if (fcb.checked) state.orphanSelected.add(id);
+        else state.orphanSelected.delete(id);
+      });
+      syncOrphanButtons();
+      renderOrphansView();
+    });
+    head.appendChild(fcb);
+
+    const name = document.createElement("strong");
+    name.className = "gdrs-orphan-folder-name";
+    name.textContent = folder.name || pdir || "(경로 없음)";
+    head.appendChild(name);
+
+    const cnt = document.createElement("span");
+    cnt.className = "gdrs-orphan-counts";
+    cnt.textContent = `대기 ${counts.pending || 0} · B ${counts.B || 0} · C ${counts.C || 0}`;
+    head.appendChild(cnt);
+
+    const isoBtn = document.createElement("button");
+    isoBtn.type = "button";
+    isoBtn.className = "gdrs-btn gdrs-btn-primary gdrs-btn-sm";
+    isoBtn.textContent = "이 폴더 격리";
+    isoBtn.disabled = ids.length === 0;
+    isoBtn.addEventListener("click", () => runOrphanAction("isolate", { parent_dir: pdir }, ids.length));
+    head.appendChild(isoBtn);
+
+    const keepBtn = document.createElement("button");
+    keepBtn.type = "button";
+    keepBtn.className = "gdrs-btn gdrs-btn-sm";
+    keepBtn.textContent = "이 폴더 보존";
+    keepBtn.disabled = ids.length === 0;
+    keepBtn.addEventListener("click", () => runOrphanAction("keep", { parent_dir: pdir }, ids.length));
+    head.appendChild(keepBtn);
+    box.appendChild(head);
+
+    const pathLine = document.createElement("div");
+    pathLine.className = "gdrs-orphan-folder-path";
+    pathLine.textContent = pdir;
+    box.appendChild(pathLine);
+
+    td.appendChild(box);
+    tr.appendChild(td);
+    return tr;
+  }
+
+  function orphanEmptyTr() {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 7;
+    td.className = "gdrs-empty";
+    td.textContent = state.orphanTotal
+      ? "현재 조건에 맞는 정리 대기 항목이 없습니다."
+      : "정리 대기 항목 없음";
+    tr.appendChild(td);
+    return tr;
+  }
+
+  // state.orphanData 로 다시 그린다 (펼침/접힘은 여기서만).
+  function renderOrphansView() {
+    const body = $("gdrs-orphan-body");
+    if (!body) return;
+    body.innerHTML = "";
+    const data = state.orphanData || {};
+    const folders = Array.isArray(data.folders) ? data.folders : null;
+    if (folders && folders.length) {
+      for (const folder of folders) {
+        body.appendChild(orphanFolderTr(folder));
+        if (state.orphanOpen.has(folder.parent_dir || "")) {
+          for (const r of (folder.items || [])) body.appendChild(orphanRowTr(r));
+          if (Array.isArray(folder.others) && (folder.others.length || folder.others_more)) {
+            body.appendChild(orphanOthersTr(folder));
+          }
+        }
+      }
+      return;
+    }
+    const rows = data.items || [];
+    if (!rows.length) {
+      body.appendChild(orphanEmptyTr());
+      return;
+    }
+    for (const r of rows) body.appendChild(orphanRowTr(r));
+  }
+
+  function renderOrphans(data) {
+    state.orphanData = data || {};
+    const folders = Array.isArray(data.folders) ? data.folders : null;
+    // §7 — folder_total==1 이면 자동 펼침 (한 번만).
+    if (folders && folders.length === 1 && !state.orphanAutoOpened) {
+      state.orphanOpen.add(folders[0].parent_dir || "");
+      state.orphanAutoOpened = true;
+    }
+    renderOrphansView();
+  }
 
   async function loadOrphans(page) {
     if (page) state.orphanPage = page;
@@ -690,6 +935,7 @@
     const params = new URLSearchParams();
     params.set("page", String(state.orphanPage));
     params.set("page_size", String(state.orphanPageSize));
+    params.set("group", "folder");   // P14 §0.5 — 폴더 단위 페이징
     if (state.orphanClass) params.set("class", state.orphanClass);
     if (state.orphanStatus) params.set("status", state.orphanStatus);
     if (state.orphanSearch) params.set("search", state.orphanSearch);
@@ -699,97 +945,22 @@
     try {
       resp = await fetch(`${API_ORPHANS}?${params.toString()}`, { credentials: "same-origin" });
     } catch (exc) {
-      body.innerHTML = `<tr><td colspan="10" class="gdrs-empty">/orphans 호출 실패: ${exc}</td></tr>`;
+      body.innerHTML = `<tr><td colspan="7" class="gdrs-empty">/orphans 호출 실패: ${exc}</td></tr>`;
       return;
     }
     if (!resp.ok) {
-      body.innerHTML = `<tr><td colspan="10" class="gdrs-empty">/orphans HTTP ${resp.status}</td></tr>`;
+      body.innerHTML = `<tr><td colspan="7" class="gdrs-empty">/orphans HTTP ${resp.status}</td></tr>`;
       return;
     }
     const data = await resp.json();
     state.orphanTotal = Number(data.total || 0);
     state.orphanPage = Number(data.page || state.orphanPage);
     state.orphanPages = Number(data.pages || 0);
-    renderOrphans(data.items || []);
+    state.orphanFolderTotal = Number(data.folder_total || 0);
+    renderOrphans(data);
     renderOrphanPagination();
-    const start = state.orphanTotal ? (state.orphanPage - 1) * state.orphanPageSize + 1 : 0;
-    const end = (state.orphanPage - 1) * state.orphanPageSize + (data.items || []).length;
     $("gdrs-orphan-note").textContent =
-      `표시 ${start}-${end} / 전체 ${nfmt(state.orphanTotal)}건 · ${state.orphanPages}페이지`;
-  }
-
-  function renderOrphans(rows) {
-    const body = $("gdrs-orphan-body");
-    body.innerHTML = "";
-    if (!rows || !rows.length) {
-      const tr = document.createElement("tr");
-      const td = document.createElement("td");
-      td.colSpan = 10;
-      td.className = "gdrs-empty";
-      td.textContent = state.orphanTotal
-        ? "현재 조건에 맞는 정리 대기 항목이 없습니다."
-        : "정리 대기 항목 없음";
-      tr.appendChild(td);
-      body.appendChild(tr);
-      return;
-    }
-    for (const r of rows) {
-      const tr = document.createElement("tr");
-      // 체크박스 — pending 이고 class B/C 만 활성. A 는 자동, 종결은 되돌리지 않는다.
-      const checkTd = document.createElement("td");
-      checkTd.className = "gdrs-col-check";
-      const selectable = r.status === "pending" && (r.class === "B" || r.class === "C");
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.disabled = !selectable;
-      cb.checked = state.orphanSelected.has(r.id);
-      cb.dataset.orphanId = r.id;
-      cb.addEventListener("change", () => {
-        if (cb.checked) state.orphanSelected.add(r.id);
-        else state.orphanSelected.delete(r.id);
-        syncOrphanButtons();
-      });
-      checkTd.appendChild(cb);
-      tr.appendChild(checkTd);
-
-      tr.appendChild(cell(r.id, "gdrs-id-cell"));
-
-      const classTd = document.createElement("td");
-      const classBadge = document.createElement("span");
-      classBadge.className = `gdrs-orphan-badge gdrs-orphan-class-${r.class || "none"}`;
-      classBadge.textContent = ORPHAN_CLASS_LABEL[r.class] || r.class || "-";
-      classTd.appendChild(classBadge);
-      tr.appendChild(classTd);
-
-      const statusTd = document.createElement("td");
-      const statusBadge = document.createElement("span");
-      statusBadge.className = `gdrs-orphan-badge gdrs-orphan-status-${r.status || "unknown"}`;
-      statusBadge.textContent = ORPHAN_STATUS_LABEL[r.status] || r.status || "-";
-      statusTd.appendChild(statusBadge);
-      tr.appendChild(statusTd);
-
-      tr.appendChild(cell(r.name || "", "gdrs-name-cell", r.local_path || ""));
-
-      const pathTd = document.createElement("td");
-      pathTd.className = "gdrs-path-cell";
-      pathTd.textContent = r.local_path || "";
-      pathTd.title = r.local_path || "";
-      if (r.trash_path) {
-        const t = document.createElement("div");
-        t.className = "gdrs-prev-path";
-        t.textContent = `→ ${r.trash_path}`;
-        pathTd.appendChild(t);
-      }
-      if (r.error) pathTd.appendChild(rowErrorSpan(r.error));
-      tr.appendChild(pathTd);
-
-      tr.appendChild(cell(r.twin_path || "", "gdrs-path-cell", r.twin_path || ""));
-      tr.appendChild(cell(fmtBytes(r.size), "gdrs-size-cell", String(r.size || 0)));
-      tr.appendChild(cell(String(r.md5 || "").slice(0, 8), "gdrs-id-cell", r.md5 || ""));
-      tr.appendChild(cell(fmtDateShort(r.created_at), "gdrs-date-cell", fmtKst(r.created_at)));
-
-      body.appendChild(tr);
-    }
+      `폴더 ${nfmt(state.orphanFolderTotal)}개 · 항목 ${nfmt(state.orphanTotal)}건 · ${state.orphanPages}페이지`;
   }
 
   function renderOrphanPagination() {
@@ -840,6 +1011,22 @@
     const data = await resp.json().catch(() => ({ success: false, error: `HTTP ${resp.status}` }));
     if (!resp.ok) alert(`실패: ${data.error || resp.status}`);
     return data;
+  }
+
+  // §9 — 확인 대화상자 문구 (부가; 화면 본문 설명을 대체하지 않는다).
+  async function runOrphanAction(action, body, n) {
+    const url = action === "isolate" ? API_ORPHANS_ISOLATE : API_ORPHANS_KEEP;
+    const msg = action === "isolate"
+      ? `선택한 ${n}건을 _trash 로 옮깁니다. 삭제가 아닙니다. 30일 안에 복구할 수 있습니다. 계속할까요?`
+      : `선택한 ${n}건을 보존합니다. 파일은 그대로 두고 다시 묻지 않습니다. 계속할까요?`;
+    if (!window.confirm(msg)) return null;
+    const out = await postOrphanAction(url, body);
+    if (out && out.success) {
+      state.orphanSelected.clear();
+      syncOrphanButtons();
+      loadOrphans(state.orphanPage);
+    }
+    return out;
   }
 
   // 탭 전환 — 해시/쿼리 없이 메모리만 (플러그인 webview 가 location 을 안 준다).
@@ -923,37 +1110,26 @@
     $("gdrs-orphan-isolate-selected").addEventListener("click", async () => {
       const ids = Array.from(state.orphanSelected);
       if (!ids.length) return;
-      if (!window.confirm(`선택한 ${ids.length}건을 _trash 로 옮깁니다(영구 삭제 아님). 계속할까요?`)) return;
-      const out = await postOrphanAction(API_ORPHANS_ISOLATE, { ids });
-      if (out && out.success) {
-        state.orphanSelected.clear();
-        syncOrphanButtons();
-        loadOrphans(state.orphanPage);
-      }
+      await runOrphanAction("isolate", { ids }, ids.length);
     });
     $("gdrs-orphan-keep-selected").addEventListener("click", async () => {
       const ids = Array.from(state.orphanSelected);
       if (!ids.length) return;
-      if (!window.confirm(`선택한 ${ids.length}건을 보존합니다. 파일은 그대로 둡니다. 계속할까요?`)) return;
-      const out = await postOrphanAction(API_ORPHANS_KEEP, { ids });
-      if (out && out.success) {
-        state.orphanSelected.clear();
-        syncOrphanButtons();
-        loadOrphans(state.orphanPage);
-      }
+      await runOrphanAction("keep", { ids }, ids.length);
     });
     const orphanAll = $("gdrs-orphan-select-all");
     if (orphanAll) {
       orphanAll.addEventListener("change", () => {
-        document.querySelectorAll("#gdrs-orphan-body tr").forEach((tr) => {
-          const cb = tr.querySelector('input[type="checkbox"]');
-          if (!cb || cb.disabled) return;
+        // 행 체크박스만 (폴더 헤더 체크박스는 data-orphan-id 가 없다).
+        document.querySelectorAll('#gdrs-orphan-body input[data-orphan-id]').forEach((cb) => {
+          if (cb.disabled) return;
           cb.checked = orphanAll.checked;
           const id = Number(cb.dataset.orphanId);
           if (orphanAll.checked) state.orphanSelected.add(id);
           else state.orphanSelected.delete(id);
         });
         syncOrphanButtons();
+        renderOrphansView();
       });
     }
     switchTab(DEFAULT_TAB);   // 기본 탭 events

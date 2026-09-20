@@ -126,7 +126,7 @@
         </select>
         <select id="gdrs-orphan-filter-status" class="gdrs-select" title="상태">
           <option value="">전체 상태</option>
-          <option value="pending">대기</option>
+          <option value="pending" selected>대기</option>
           <option value="isolated">격리됨</option>
           <option value="kept">보존</option>
           <option value="failed">실패</option>
@@ -144,27 +144,26 @@
     <div class="gdrs-panel-note-row">
       <span class="gdrs-panel-note" id="gdrs-orphan-note">불러오는 중…</span>
     </div>
-    <div class="gdrs-panel-note-row">
-      <span class="gdrs-panel-note">중복(A)은 자동으로 <code>_trash</code> 로 옮깁니다. 파일은 30일 후 정리되며 휴지통 비우기 전엔 복원할 수 있습니다. 영구 삭제 버튼은 없습니다.</span>
+    <div class="gdrs-panel-note-row" id="gdrs-orphan-help">
+      <div class="gdrs-orphan-help-line"><strong>격리:</strong> 삭제하지 않습니다. 파일을 <code>_trash/오늘날짜/원래경로</code> 로 옮기고, 30일 안에 그 폴더에서 되돌릴 수 있습니다. 30일이 지나면 자동 정리됩니다.</div>
+      <div class="gdrs-orphan-help-line"><strong>보존:</strong> 파일은 지금 자리에 둡니다. 이 목록에서 빼 다시 묻지 않습니다.</div>
+      <div class="gdrs-orphan-help-line">중복(A)은 이미 자동으로 옮겼습니다. 영구 삭제 버튼은 없습니다.</div>
     </div>
     <div class="gdrs-jobs-table-wrap">
       <table class="gdrs-jobs-table" id="gdrs-orphan-table">
         <thead>
           <tr>
             <th class="gdrs-col-check"><input type="checkbox" id="gdrs-orphan-select-all" title="현재 페이지 전체 선택"></th>
-            <th>id</th>
-            <th>등급</th>
-            <th>상태</th>
-            <th>이름</th>
-            <th>경로</th>
-            <th>대조</th>
-            <th>크기</th>
-            <th>md5</th>
-            <th>생성</th>
+            <th class="gdrs-orphan-col-class">등급</th>
+            <th>옛 파일</th>
+            <th class="gdrs-orphan-col-size">옛 크기</th>
+            <th>새 파일</th>
+            <th class="gdrs-orphan-col-size">새 크기</th>
+            <th class="gdrs-orphan-col-delta">차이</th>
           </tr>
         </thead>
         <tbody id="gdrs-orphan-body">
-          <tr><td colspan="10" class="gdrs-empty">데이터 없음</td></tr>
+          <tr><td colspan="7" class="gdrs-empty">데이터 없음</td></tr>
         </tbody>
       </table>
     </div>

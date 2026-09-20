@@ -1674,29 +1674,106 @@ def _names_similar(a: str, b: str) -> bool:
     return ratio >= 0.55
 
 
-def classify_orphan(row: dict, *, md5_file_fn=md5_file) -> dict:
-    """§5.3 — 고아 1건을 디스크로 판정한다. store 쓰기·이동 없음 (순수에 가깝다).
+def _orphan_volume(name: str) -> str:
+    """파일명에서 `(\\d+)권` 의 숫자를 뽑는다. 없으면 ''. (§5.3 / §0.2)
 
-    반환: {class: 'A'|'B'|'C'|'missing', md5, size, twin_path, error}.
-    같은 parent_dir 만 본다 — 상위/하위 폴더로 퍼지지 않는다.
+    `01권#164.zip` → `01`. 순위·reason 의 `vol:` 키에만 쓴다 (판정 규칙 아님).
     """
+    import re as _re
+    m = _re.search(r"(\d+)\s*권", str(name or ""))
+    return m.group(1) if m else ""
+
+
+def _rank_b_candidates(src_name: str, src_size: int, entries: list) -> list[dict]:
+    """§0.2 — B 후보를 1순위 규칙으로 정렬한다.
+
+    등급 판정이 아니라 **기록·표시**용 순위다. 후보 dict 에 `md5` 를 넣지 않는다 (§0.1).
+    순위: ① 같은 권 토큰 ② (고아 아닌 이웃만 — 호출 측이 이미 필터) ③ ratio 내림차순
+    ④ `abs(size 차이)` 오름차순.
+    """
+    import difflib
+    import re as _re
+    own_vol = _orphan_volume(src_name)
+    own_tokens = set(_re.findall(r"#\d+", str(src_name or "")))
+    own_stem = os.path.splitext(str(src_name or ""))[0].lower()
+    scored: list[dict] = []
+    for e in entries:
+        try:
+            esize = int(e.stat().st_size)
+        except OSError:
+            esize = 0
+        estem = os.path.splitext(e.name)[0].lower()
+        ratio = difflib.SequenceMatcher(None, own_stem, estem).ratio()
+        evol = _orphan_volume(e.name)
+        shared = own_tokens & set(_re.findall(r"#\d+", e.name))
+        if own_vol and evol and own_vol == evol:
+            reason = f"vol:{evol}"
+        elif shared:
+            reason = f"token:{sorted(shared)[0]}"
+        else:
+            reason = f"ratio:{ratio:.3f}"
+        scored.append({
+            "path": str(e), "name": e.name, "size": esize,
+            "reason": reason, "ratio": round(ratio, 3), "volume": evol,
+        })
+
+    def _sort_key(c: dict):
+        return (0 if c["reason"].startswith("vol:") else 1,
+                -c["ratio"], abs(c["size"] - int(src_size or 0)))
+
+    scored.sort(key=_sort_key)
+    return scored
+
+
+def classify_orphan(
+    row: dict, *, md5_file_fn=md5_file, exclude_names: set | None = None
+) -> dict:
+    """§3.1 / §5.3 — 고아 1건을 디스크로 판정한다. store 쓰기·이동 없음.
+
+    반환: class, md5, size, twin_path, error + P14 후보 필드
+    (candidate_size, candidate_reason, candidates).
+    같은 parent_dir 만 본다 — 상위/하위 폴더로 퍼지지 않는다.
+
+    `exclude_names`: 같은 폴더의 다른 pending 고아 basename 집합.
+    등급(B/C/A) 계산에는 **쓰지 않고**, 1순위 대조에서만 후순위로 민다.
+    """
+    empty = {"class": "missing", "md5": "", "size": 0, "twin_path": "",
+             "error": "file not found", "candidate_size": 0,
+             "candidate_reason": "", "candidates": []}
     src = Path(str(row.get("local_path") or ""))
     try:
         if not src or not src.is_file():
-            return {"class": "missing", "md5": "", "size": 0,
-                    "twin_path": "", "error": "file not found"}
+            return dict(empty)
         size = int(src.stat().st_size)
-        local_md5 = md5_file_fn(src)   # §5.2 — 로컬 실물 1회 해시 (항상)
     except OSError as exc:
-        return {"class": "missing", "md5": "", "size": 0,
-                "twin_path": "", "error": str(exc)}
+        out = dict(empty)
+        out["error"] = str(exc)
+        return out
+
+    # §0.4 — 이미 32 hex 이고 디스크 size 가 같으면 고아 재해시를 생략한다
+    # (운영 pending B 128 은 전원 md5 32자 + size>0). size 가 바뀌었거나 md5 가
+    # 짧으면 오늘처럼 1회 해시한다.
+    stored_md5 = str(row.get("md5") or "").strip().lower()
+    try:
+        stored_size = int(row.get("size") or 0)
+    except (TypeError, ValueError):
+        stored_size = 0
+    if len(stored_md5) == 32 and stored_size == size:
+        local_md5 = stored_md5
+    else:
+        try:
+            local_md5 = md5_file_fn(src)
+        except OSError as exc:
+            out = dict(empty)
+            out["error"] = str(exc)
+            return out
 
     try:
         entries = [e for e in src.parent.iterdir() if e.is_file() and e.name != src.name]
     except OSError:
         entries = []
 
-    # twins: 같은 폴더 · 다른 이름 · size 같음 · md5 같음. size 다른 이웃은 해시 안 함.
+    # A — twins: 같은 폴더 · 다른 이름 · size 같음 · md5 같음. size 다른 이웃은 해시 안 함.
     twins: list[Path] = []
     for entry in entries:
         try:
@@ -1711,15 +1788,30 @@ def classify_orphan(row: dict, *, md5_file_fn=md5_file) -> dict:
             continue
     if twins:
         return {"class": "A", "md5": local_md5, "size": size,
-                "twin_path": str(twins[0]), "error": ""}
+                "twin_path": str(twins[0]), "error": "",
+                "candidate_size": size, "candidate_reason": "md5",
+                "candidates": []}
 
-    # 이름 유사 이웃 → B, 없으면 C. (해시 없음)
-    for entry in entries:
-        if _names_similar(src.name, entry.name):
+    # B — 같은 확장자 이웃 중 _names_similar. 판정 규칙 불변 (T-P13-5/6).
+    similar = [e for e in entries if _names_similar(src.name, e.name)]
+    if similar:
+        excluded = set(exclude_names or ())
+        nonorphan = [e for e in similar if e.name not in excluded]
+        if not nonorphan:
+            # 다른 pending 고아와만 유사 — 등급은 B 유지, 대조는 비우고 이유만 (§0.2).
             return {"class": "B", "md5": local_md5, "size": size,
-                    "twin_path": "", "error": ""}
+                    "twin_path": "", "error": "",
+                    "candidate_size": 0, "candidate_reason": "sibling_only",
+                    "candidates": []}
+        ranked = _rank_b_candidates(src.name, size, nonorphan)
+        best = ranked[0]
+        return {"class": "B", "md5": local_md5, "size": size,
+                "twin_path": best["path"], "error": "",
+                "candidate_size": best["size"], "candidate_reason": best["reason"],
+                "candidates": ranked[:8]}
     return {"class": "C", "md5": local_md5, "size": size,
-            "twin_path": "", "error": ""}
+            "twin_path": "", "error": "",
+            "candidate_size": 0, "candidate_reason": "", "candidates": []}
 
 
 def _ensure_trash_root(local_root: Path) -> Path:
@@ -1832,17 +1924,30 @@ def _scan_touch_after_isolate(store, cfg: dict, parent_dir: str, *, log=print) -
 
 
 def classify_pending_orphans(store, cfg: dict, *, log=print) -> dict:
-    """§5.4 — pending 전부 분류. A 는 isolate_orphan 즉시. B/C 는 class 만 기록.
+    """§5.4 / P14 §5.2 — pending 전부 분류. A 는 isolate_orphan 즉시. B/C 는 기록만.
 
-    반환: {classified, isolated, pending_bc, missing, failed}.
+    kept/isolated/missing/failed 행은 `orphan_pending()` 이 아예 안 읽으므로
+    이 함수가 건드리지 않는다 (§P14-7/8). 반환: {classified, isolated, pending_bc,
+    missing, failed}.
     """
-    import time as _t  # noqa: F401  (일관성: 시각은 _iso_now 사용)
+    import json as _json
     summary = {"classified": 0, "isolated": 0, "pending_bc": 0,
                "missing": 0, "failed": 0}
     now = _iso_now()
-    for row in store.orphan_pending():
+    pending = store.orphan_pending()
+    # 같은 폴더의 다른 pending 고아 basename — 등급이 아니라 1순위 대조에서만 쓴다 (§0.2).
+    by_parent: dict[str, set] = {}
+    for r in pending:
+        by_parent.setdefault(str(r.get("parent_dir") or ""), set()).add(
+            os.path.basename(str(r.get("local_path") or ""))
+        )
+    for row in pending:
+        pdir = str(row.get("parent_dir") or "")
+        own_name = os.path.basename(str(row.get("local_path") or ""))
+        exclude = set(by_parent.get(pdir, set()))
+        exclude.discard(own_name)
         try:
-            verdict = classify_orphan(row)
+            verdict = classify_orphan(row, exclude_names=exclude)
         except Exception as exc:
             store.orphan_update(int(row["id"]), **{
                 "status": "failed", "error": str(exc), "classified_at": now})
@@ -1859,8 +1964,12 @@ def classify_pending_orphans(store, cfg: dict, *, log=print) -> dict:
             continue
         fields = {
             "class": klass, "md5": verdict["md5"], "size": verdict["size"],
-            "twin_path": verdict["twin_path"] or "", "classified_at": now,
-            "error": "",
+            "twin_path": verdict["twin_path"] or "",
+            "candidate_size": int(verdict.get("candidate_size") or 0),
+            "candidate_reason": verdict.get("candidate_reason") or "",
+            "candidates_json": _json.dumps(verdict.get("candidates") or [],
+                                           ensure_ascii=False, separators=(",", ":")),
+            "classified_at": now, "error": "",
         }
         if klass == "A":
             res = isolate_orphan(store, {**row, **fields}, cfg, log=log)
@@ -1886,6 +1995,7 @@ def classify_pending_orphans(store, cfg: dict, *, log=print) -> dict:
                 store.orphan_update(int(row["id"]), **fields)
                 summary["failed"] += 1
         else:
+            # B/C — status 는 pending 유지. 후보·이유를 기록해 화면이 판단하게 한다.
             store.orphan_update(int(row["id"]), **fields)
             summary["pending_bc"] += 1
     return summary

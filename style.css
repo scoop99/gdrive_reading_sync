@@ -440,6 +440,80 @@
     white-space: nowrap;
 }
 
+/* P14 §8.3 — 고아 표만의 가로 스크롤 방지 계약. 변경 이벤트 표 CSS 는 건드리지 않는다. */
+#gdrs-tab-orphans .gdrs-jobs-table-wrap { overflow-x: hidden; }
+#gdrs-orphan-table { table-layout: fixed; width: 100%; }
+/* 고아 표의 이름 열은 줄바꿈한다 (긴 리디 파일명). */
+#gdrs-orphan-table .gdrs-name-cell {
+    max-width: none;
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    word-break: break-all;
+}
+#gdrs-orphan-table .gdrs-col-check { width: 36px; }
+#gdrs-orphan-table .gdrs-orphan-col-class { width: 72px; }
+#gdrs-orphan-table .gdrs-orphan-col-size { width: 88px; }
+#gdrs-orphan-table .gdrs-orphan-col-delta { width: 96px; }
+/* min-width:260px 는 스크롤의 원인이었다 — 고아 표에는 쓰지 않는다. */
+#gdrs-orphan-table .gdrs-path-cell { min-width: 0; max-width: none; }
+
+/* P14 §9 — 격리/보존 의미 설명 (보이는 본문, 툴팁 아님). 흐린 회색으로 묻히면 안 된다. */
+.gdrs-orphan-help-line {
+    color: #cbd5e1;
+    font-size: 0.8rem;
+    line-height: 1.6;
+    margin-top: 3px;
+}
+.gdrs-orphan-help-line strong { color: #e2e8f0; }
+.gdrs-orphan-help-line code { color: #c4b5fd; }
+.gdrs-muted-cell { color: var(--app-text-muted); }
+.gdrs-orphan-more { font-size: 0.74rem; color: var(--app-text-muted); margin-top: 2px; }
+.gdrs-orphan-status-inline { font-size: 0.72rem; color: var(--app-text-muted); margin-top: 2px; }
+
+/* P14 §7 — 폴더 헤더 (한 줄) */
+.gdrs-orphan-folder-row > td { background: rgba(127, 127, 127, 0.08); padding: 8px; }
+.gdrs-orphan-folder-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.gdrs-orphan-toggle {
+    flex: 0 0 auto;
+    width: 24px;
+    height: 24px;
+    border: 1px solid var(--app-border);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--app-text-primary);
+    cursor: pointer;
+    font-size: 0.8rem;
+    line-height: 1;
+}
+.gdrs-orphan-folder-name { color: var(--app-text-primary); font-size: 0.9rem; }
+.gdrs-orphan-counts {
+    font-size: 0.78rem;
+    color: var(--app-text-muted);
+    font-variant-numeric: tabular-nums;
+}
+.gdrs-orphan-folder-path {
+    margin-top: 4px;
+    font-size: 0.78rem;
+    color: var(--app-text-muted);
+    white-space: normal;
+    word-break: break-all;
+}
+.gdrs-btn-sm { padding: 4px 10px; font-size: 0.78rem; }
+.gdrs-orphan-others-row > td { background: rgba(127, 127, 127, 0.05); padding: 8px; }
+.gdrs-orphan-others-head { font-size: 0.78rem; color: var(--app-text-muted); margin-bottom: 4px; }
+.gdrs-orphan-others-list {
+    font-size: 0.78rem;
+    color: var(--app-text-secondary, var(--app-text-muted));
+    white-space: normal;
+    word-break: break-all;
+}
+
 .gdrs-pagination {
     display: flex;
     gap: 4px;

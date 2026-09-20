@@ -3911,6 +3911,308 @@ def test_T_P13_NODEL_no_destructive_calls_outside_allowed():
     print("  OK T-P13-NODEL: 영구삭제/이동은 허용 함수 밖에 없다")
 
 
+# ============================================================================
+# P14 — 정리 대기 화면을 판단 가능하게 (v0.4.1)
+# ============================================================================
+# A/B/C 판정 규칙은 불변. B 후보를 "기록·순위"만 한다. 운영 숫자 하드코딩 금지.
+
+def _orphan_row(store, local_path: str, *, md5="", size=0, klass="",
+                status="pending", parent_dir=None, twin_path="",
+                job_id=1, file_id="f") -> int:
+    """orphan 행을 직접 시드. parent_dir 기본은 dirname(local_path)."""
+    oid = store.orphan_upsert_from_job({
+        "id": job_id, "file_id": file_id, "local_path": local_path,
+        "size": size, "md5": md5, "remote_path": "",
+    })
+    fields = {"class": klass, "status": status}
+    if md5:
+        fields["md5"] = md5
+    if size:
+        fields["size"] = size
+    if twin_path:
+        fields["twin_path"] = twin_path
+    store.orphan_update(oid, **fields)
+    return oid
+
+
+def test_T_P14_1_b_candidate_is_same_volume_new_file():
+    """T-P14-1 — 고아 01권#164 + 새 01권/02권 (리디)#164 → B, 1순위는 01권 새 파일."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_orphan
+    tmp = Path(tempfile.mkdtemp()) / "책"
+    orphan = _orphan_file(tmp, "01권#164.zip", b"A" * 40)
+    new01 = _orphan_file(tmp, "전생 왕녀와 천재 영애의 마법 혁명 01권 (리디)#164.zip", b"B" * 55)
+    _orphan_file(tmp, "전생 왕녀와 천재 영애의 마법 혁명 02권 (리디)#164.zip", b"C" * 61)
+    v = classify_orphan({"local_path": str(orphan), "id": 1})
+    assert v["class"] == "B", v
+    assert v["twin_path"].endswith("01권 (리디)#164.zip"), v["twin_path"]
+    assert v["candidate_size"] == 55, v
+    assert v["candidate_reason"].startswith("vol:"), v
+    assert v["candidates"] and len(v["candidates"]) == 2, v["candidates"]
+    print("  OK T-P14-1 B 1순위 = 같은 권 새 파일 (vol:)")
+
+
+def test_T_P14_2_volume_token_beats_other_volume():
+    """T-P14-2 — 03권#180 + 새 03권#180 + 새 07권#180 → 1순위는 03권 (07권 아님)."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_orphan
+    tmp = Path(tempfile.mkdtemp()) / "책"
+    orphan = _orphan_file(tmp, "03권#180.zip", b"A" * 40)
+    _orphan_file(tmp, "전생 왕녀 03권 (리디)#180.zip", b"B" * 55)
+    _orphan_file(tmp, "전생 왕녀 07권 (리디)#180.zip", b"C" * 61)
+    v = classify_orphan({"local_path": str(orphan), "id": 1})
+    assert v["class"] == "B", v
+    assert "03권 (리디)#180.zip" in v["twin_path"], v["twin_path"]
+    assert "07권" not in v["twin_path"], v["twin_path"]
+    print("  OK T-P14-2 같은 권 토큰이 다른 권보다 우선")
+
+
+def test_T_P14_3_sibling_only_when_no_new_file():
+    """T-P14-3 — 고아 두 개만, 새 파일 없음. 둘 다 B, 대조 비움 + sibling_only."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_orphan
+    tmp = Path(tempfile.mkdtemp()) / "책"
+    o1 = _orphan_file(tmp, "01권#164.zip", b"A" * 40)
+    o2 = _orphan_file(tmp, "02권#164.zip", b"B" * 55)
+    others = {"02권#164.zip"}
+    v1 = classify_orphan({"local_path": str(o1), "id": 1}, exclude_names=others)
+    v2 = classify_orphan({"local_path": str(o2), "id": 2}, exclude_names={"01권#164.zip"})
+    for v in (v1, v2):
+        assert v["class"] == "B", v           # 등급 규칙 불변
+        assert v["twin_path"] == "", v
+        assert v["candidate_reason"] == "sibling_only", v
+        assert v["candidates"] == [], v
+    print("  OK T-P14-3 고아끼리만 유사 → B + sibling_only, 대조 비움")
+
+
+def test_T_P14_4_b_row_persists_comparable_candidate():
+    """T-P14-4 — B 행에 비교 대상이 저장된다: twin_path 비지 않음, candidate_size>0,
+    abs(candidate_size - size) > 0."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    tmp = Path(tempfile.mkdtemp()) / "책"
+    orphan = _orphan_file(tmp, "01권#164.zip", b"A" * 40)
+    _orphan_file(tmp, "전생 왕녀 01권 (리디)#164.zip", b"B" * 55)
+    store = _store()
+    _orphan_row(store, str(orphan))
+    cfg = dict(CFG, LOCAL_ROOT=str(tmp))
+    classify_pending_orphans(store, cfg, log=lambda *a: None)
+    row = store.orphan_list_page()["items"][0]
+    assert row["class"] == "B", row
+    assert row["twin_path"], row
+    assert int(row["candidate_size"]) > 0, row
+    assert abs(int(row["candidate_size"]) - int(row["size"])) > 0, row
+    assert row["candidate_reason"].startswith("vol:"), row
+    print("  OK T-P14-4 B 행에 비교 대상(경로·크기)이 저장됨")
+
+
+def test_T_P14_5_valid_stored_md5_skips_orphan_hash():
+    """T-P14-5 — md5 32hex + disk size == row.size 면 고아 해시 0,
+    같은 size 이웃만 해시(A 게이트)."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_orphan
+    tmp = Path(tempfile.mkdtemp()) / "책"
+    payload = b"A" * 40
+    orphan = _orphan_file(tmp, "a#1.zip", payload)
+    _orphan_file(tmp, "b#1.zip", b"B" * 40)   # 같은 size, 다른 내용
+    calls = {"n": 0}
+
+    def _md5(p):
+        calls["n"] += 1
+        return _file_bytes_md5(Path(p).read_bytes())
+
+    v = classify_orphan({"local_path": str(orphan), "id": 1,
+                         "md5": _file_bytes_md5(payload), "size": 40},
+                        md5_file_fn=_md5)
+    assert calls["n"] == 1, f"고아 재해시 생략 + 이웃 1회여야 한다: {calls['n']}"
+    assert v["class"] in ("A", "B"), v
+    print("  OK T-P14-5 저장 md5 유효 → 고아 해시 생략 (이웃만 1회)")
+
+
+def test_T_P14_6_size_different_neighbors_no_hash():
+    """T-P14-6 — size 다른 이웃만 있으면 해시 0 (md5 가 이미 있을 때). T-P13-18 과 함께."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_orphan
+    tmp = Path(tempfile.mkdtemp()) / "책"
+    payload = b"A" * 40
+    orphan = _orphan_file(tmp, "only#1.zip", payload)
+    _orphan_file(tmp, "other#1.zip", b"B" * 7)   # size 다름
+    calls = {"n": 0}
+
+    def _md5(p):
+        calls["n"] += 1
+        return _file_bytes_md5(Path(p).read_bytes())
+
+    v = classify_orphan({"local_path": str(orphan), "id": 1,
+                         "md5": _file_bytes_md5(payload), "size": 40},
+                        md5_file_fn=_md5)
+    assert calls["n"] == 0, f"size 다른 이웃만 있으면 해시 0: {calls['n']}"
+    assert v["class"] in ("B", "C"), v
+    print("  OK T-P14-6 size 다른 이웃만 → 해시 0")
+
+
+def test_T_P14_7_kept_rows_untouched():
+    """T-P14-7 — classify_pending_orphans 가 kept 행을 못 건드린다."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    tmp = Path(tempfile.mkdtemp()) / "책"
+    kept_file = _orphan_file(tmp, "kept#9.zip", b"K" * 20)
+    pend_file = _orphan_file(tmp, "pend#1.zip", b"P" * 20)
+    _orphan_file(tmp, "pend 01권 (리디)#1.zip", b"Q" * 30)
+    store = _store()
+    kept_id = _orphan_row(store, str(kept_file), klass="B", status="kept", size=20)
+    _orphan_row(store, str(pend_file), job_id=2)
+    before = store.orphan_get(kept_id)
+    cfg = dict(CFG, LOCAL_ROOT=str(tmp))
+    classify_pending_orphans(store, cfg, log=lambda *a: None)
+    after = store.orphan_get(kept_id)
+    for k in ("status", "class", "local_path", "trash_path"):
+        assert after[k] == before[k], (k, before[k], after[k])
+    assert kept_file.is_file(), "kept 파일이 이동했다"
+    print("  OK T-P14-7 kept 행/파일 불변")
+
+
+def test_T_P14_8_isolated_rows_untouched():
+    """T-P14-8 — isolated 행은 재분류가 안 건드린다 (trash_path 유지, 재이동 없음)."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    tmp = Path(tempfile.mkdtemp()) / "책"
+    trash_file = _orphan_file(tmp / "_trash" / "2026-09-20", "gone#1.zip", b"G" * 20)
+    store = _store()
+    iid = _orphan_row(store, str(tmp / "책" / "gone#1.zip"), klass="A",
+                      status="isolated", size=20, twin_path=str(trash_file))
+    store.orphan_update(iid, trash_path=str(trash_file))
+    before = store.orphan_get(iid)
+    cfg = dict(CFG, LOCAL_ROOT=str(tmp))
+    classify_pending_orphans(store, cfg, log=lambda *a: None)
+    after = store.orphan_get(iid)
+    assert after["status"] == "isolated" and after["trash_path"] == before["trash_path"], after
+    assert trash_file.is_file(), "isolated 파일이 사라졌다"
+    print("  OK T-P14-8 isolated 행 불변 (재이동 없음)")
+
+
+def test_T_P14_9_list_page_group_folder():
+    """T-P14-9 — group='folder': 두 parent_dir × 3행 → folder_total 2, 각 3행,
+    같은 parent 가 두 폴더로 쪼개지지 않는다."""
+    store = _store()
+    for di, d in enumerate(("책/A", "책/B")):
+        for i in range(3):
+            _orphan_row(store, str(Path("T:/LIB") / d / f"{i}.zip"),
+                        job_id=di * 10 + i + 1, klass="B")
+    out = store.orphan_list_page(page=1, page_size=50, group="folder")
+    assert out["folder_total"] == 2, out
+    assert len(out["folders"]) == 2, out["folders"]
+    for f in out["folders"]:
+        assert len(f["items"]) == 3, f
+        assert {r["parent_dir"] for r in f["items"]} == {f["parent_dir"]}, f
+    assert out["pages"] == 1, out
+    assert out["total"] == 6, out
+    print("  OK T-P14-9 folder 그룹: 2폴더 × 3행, 안 쪼개짐")
+
+
+def test_T_P14_10_ids_pending_in_parent():
+    """T-P14-10 — orphan_ids_pending_in_parent 는 pending B/C 만. A/kept 제외."""
+    store = _store()
+    p = "T:/LIB/책/series"
+    b_id = _orphan_row(store, f"{p}/b#1.zip", klass="B", job_id=1)
+    c_id = _orphan_row(store, f"{p}/c#2.zip", klass="C", job_id=2)
+    _orphan_row(store, f"{p}/a#3.zip", klass="A", job_id=3)         # A 제외
+    _orphan_row(store, f"{p}/k#4.zip", klass="B", status="kept", job_id=4)  # kept 제외
+    got = store.orphan_ids_pending_in_parent(p)
+    assert got == [b_id, c_id], (got, b_id, c_id)
+    assert store.orphan_ids_pending_in_parent("") == []
+    print("  OK T-P14-10 parent_dir 의 pending B/C id 만")
+
+
+def test_T_P14_11_post_parent_dir_isolates_that_folder_only():
+    """T-P14-11 — POST {parent_dir} 가 그 폴더 pending B 를 격리. 다른 폴더는 원위치."""
+    import unittest.mock as _mock
+    import plugins.metadata.gdrive_reading_sync.gdrive_reading_sync as _g
+    root = Path(tempfile.mkdtemp()) / "READING"
+    f1 = _orphan_file(root, "책A/old#1.zip", b"A" * 30)
+    f2 = _orphan_file(root, "책B/old#1.zip", b"B" * 30)
+    store = _store()
+    p1 = str(f1.parent)
+    p2 = str(f2.parent)
+    _orphan_row(store, str(f1), klass="B", job_id=1)
+    _orphan_row(store, str(f2), klass="B", job_id=2)
+
+    class _Req:
+        def get_json(self, force=False, silent=False):
+            return {"parent_dir": p1}
+
+    provider = GdriveReadingSyncMetadataProvider()
+    provider._cfg = lambda db_type="general": {"LOCAL_ROOT": str(root)}
+    flask_stub = sys.modules["flask"]
+    with _mock.patch.object(flask_stub, "request", _Req()), \
+         _mock.patch.object(_g, "open_store", return_value=store):
+        provider._route_orphans_isolate()
+    m = {str(r["local_path"]): r for r in store.orphan_list_page()["items"]}
+    assert m[str(f1)]["status"] == "isolated", m[str(f1)]
+    assert not f1.exists(), "P1 파일이 안 옮겨짐"
+    assert m[str(f2)]["status"] == "pending", m[str(f2)]
+    assert f2.is_file(), "P2 파일이 옮겨졌다 (다른 폴더 침범)"
+    print("  OK T-P14-11 parent_dir 일괄 격리 — 그 폴더만")
+
+
+def test_T_P14_12_c_row_has_no_candidate():
+    """T-P14-12 — C 행: twin_path '', reason '', 이동 없음."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    tmp = Path(tempfile.mkdtemp()) / "책"
+    orphan = _orphan_file(tmp, "solo.zip", b"S" * 20)
+    store = _store()
+    _orphan_row(store, str(orphan))
+    cfg = dict(CFG, LOCAL_ROOT=str(tmp))
+    classify_pending_orphans(store, cfg, log=lambda *a: None)
+    row = store.orphan_list_page()["items"][0]
+    assert row["class"] == "C", row
+    assert row["twin_path"] == "", row
+    assert row["candidate_reason"] == "", row
+    assert row["status"] == "pending", row
+    assert orphan.is_file(), "C 인데 이동했다"
+    print("  OK T-P14-12 C 행: 대조·이유 비움, 이동 없음")
+
+
+def test_T_P14_13_candidates_have_no_md5_key():
+    """T-P14-13 — candidates 에 md5 키 없음. size 다른 이웃만 있으면 해시 0."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_orphan
+    tmp = Path(tempfile.mkdtemp()) / "책"
+    orphan = _orphan_file(tmp, "01권#164.zip", b"A" * 40)
+    _orphan_file(tmp, "01권 (리디)#164.zip", b"B" * 7)   # size 다름
+    calls = {"n": 0}
+
+    def _md5(p):
+        calls["n"] += 1
+        return _file_bytes_md5(Path(p).read_bytes())
+
+    v = classify_orphan({"local_path": str(orphan), "id": 1,
+                         "md5": _file_bytes_md5(b"A" * 40), "size": 40},
+                        md5_file_fn=_md5)
+    assert calls["n"] == 0, calls
+    assert v["class"] == "B", v
+    for c in v["candidates"]:
+        assert "md5" not in c, c
+        for k in ("path", "name", "size", "reason", "ratio", "volume"):
+            assert k in c, (k, c)
+    print("  OK T-P14-13 candidates md5 키 없음 + 해시 0")
+
+
+def test_T_P14_14_orphan_thead_has_no_id_md5_created():
+    """T-P14-14 — index.html 고아 thead 에 단독 열 헤더 id/md5/생성 이 없다."""
+    import re as _re
+    html = (Path(__file__).resolve().parent / "index.html").read_text(encoding="utf-8")
+    m = _re.search(r'<table[^>]*id="gdrs-orphan-table".*?<thead>(.*?)</thead>', html, _re.S)
+    assert m, "고아 thead 를 못 찾음"
+    ths = _re.findall(r"<th[^>]*>(.*?)</th>", m.group(1), _re.S)
+    texts = [_re.sub(r"<[^>]+>", "", t).strip() for t in ths]
+    for bad in ("id", "md5", "생성"):
+        assert bad not in texts, (bad, texts)
+    assert len(texts) == 7, texts
+    print("  OK T-P14-14 고아 thead 7열, id/md5/생성 헤더 없음")
+
+
+def test_T_P14_15_help_text_is_visible():
+    """T-P14-15 — 격리/보존 안내가 visible 본문(title 속성 아님)에 있다."""
+    import re as _re
+    html = (Path(__file__).resolve().parent / "index.html").read_text(encoding="utf-8")
+    body = _re.sub(r'title="[^"]*"', "", html)   # 툴팁 제거 후 확인
+    for needle in ("삭제하지 않습니다", "30일", "다시 묻지 않습니다"):
+        assert needle in body, f"안내 문구 누락: {needle}"
+    print("  OK T-P14-15 격리/보존 설명이 보이는 본문에 있다")
+
+
 if __name__ == "__main__":
     tests = [
         # 기존 6종 (1라운드 회귀)
@@ -4049,6 +4351,22 @@ if __name__ == "__main__":
         test_T_P13_18_size_gate_skips_md5_of_other_sized_neighbor,
         test_T_P13_19_missing_when_file_gone,
         test_T_P13_NODEL_no_destructive_calls_outside_allowed,
+        # P14 — 정리 대기 화면 판단 가능 (v0.4.1) 신규
+        test_T_P14_1_b_candidate_is_same_volume_new_file,
+        test_T_P14_2_volume_token_beats_other_volume,
+        test_T_P14_3_sibling_only_when_no_new_file,
+        test_T_P14_4_b_row_persists_comparable_candidate,
+        test_T_P14_5_valid_stored_md5_skips_orphan_hash,
+        test_T_P14_6_size_different_neighbors_no_hash,
+        test_T_P14_7_kept_rows_untouched,
+        test_T_P14_8_isolated_rows_untouched,
+        test_T_P14_9_list_page_group_folder,
+        test_T_P14_10_ids_pending_in_parent,
+        test_T_P14_11_post_parent_dir_isolates_that_folder_only,
+        test_T_P14_12_c_row_has_no_candidate,
+        test_T_P14_13_candidates_have_no_md5_key,
+        test_T_P14_14_orphan_thead_has_no_id_md5_created,
+        test_T_P14_15_help_text_is_visible,
     ]
     for fn in tests:
         fn()

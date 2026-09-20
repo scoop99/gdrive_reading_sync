@@ -3,7 +3,7 @@
 // 구 화면이 `전체 N건 · 완료 M` 만 보여줘서 실제 84% 진행을 1% 처럼 보이게 했다.
 // 여기서 지키는 계약은 하나다: **진행률의 분자는 종결(완료+중복+실패) 전부다.**
 const assert = require("assert");
-const { computeProgress, normalizeTab, DEFAULT_TAB } = require("./script.js");
+const { computeProgress, normalizeTab, DEFAULT_TAB, formatSizeDelta } = require("./script.js");
 
 // 1) 운영 실측값 (2026-09-10). 이게 이 수정의 이유다.
 {
@@ -75,3 +75,17 @@ assert.strictEqual(normalizeTab("events"), "events");
 assert.strictEqual(normalizeTab("orphans"), "orphans");
 assert.strictEqual(normalizeTab("bogus"), "events");
 console.log("  OK normalizeTab 6-case (기본 events · orphans 만 예외)");
+
+// P14 §3.6 — 옛/새 크기 차이. 판단의 핵심(화질 개선 여부). 부호는 ASCII.
+// 운영 실측 01권: 옛 78,680,116 → 새 75,586,155 (−3.0 MB).
+{
+  const d = formatSizeDelta(78680116, 75586155);
+  assert.ok(d.startsWith("-"), `부호가 - 여야 한다: ${d}`);
+  assert.ok(d.includes("MB"), `MB 단위여야 한다: ${d}`);
+  assert.strictEqual(formatSizeDelta(75586155, 78680116).startsWith("+"), true);
+  assert.strictEqual(formatSizeDelta(1, 1), "0");        // 차이 0
+  assert.strictEqual(formatSizeDelta(100, 0), "—");      // 후보 없음
+  assert.strictEqual(formatSizeDelta(0, 100), "—");
+  assert.strictEqual(formatSizeDelta(100, null), "—");
+}
+console.log("  OK formatSizeDelta (부호·MB·차이0='0'·후보없음='—')");

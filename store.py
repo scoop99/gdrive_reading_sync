@@ -122,6 +122,11 @@ _MIGRATIONS = [
     "ALTER TABLE sync_state ADD COLUMN dry_run_promoted INTEGER NOT NULL DEFAULT 0",
     # P13 §3.3 — 과거 remote_deleted job 백필 1회 가드. 0 이면 아직 안 돌았다.
     "ALTER TABLE sync_state ADD COLUMN orphan_backfill_done INTEGER NOT NULL DEFAULT 0",
+    # P14 §3.3 — B 후보 기록용. 1순위는 기존 조회 열(twin_path + candidate_size/reason),
+    # 나머지는 JSON. 별도 테이블을 만들지 않는다 (후보가 판정의 SSOT 가 아니다).
+    "ALTER TABLE orphan ADD COLUMN candidate_size INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE orphan ADD COLUMN candidate_reason TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE orphan ADD COLUMN candidates_json TEXT NOT NULL DEFAULT '[]'",
 ]
 
 _INIT_LOCK = threading.Lock()
@@ -1009,10 +1014,12 @@ class Store:
 
     # ---- P13 — 고아(원격 삭제) 파일 격리 큐 -------------------------
 
-    # orphan_update 허용 키 (§3.4). 그 외는 KeyError.
+    # orphan_update 허용 키 (§3.4 / P14 §3.3). 그 외는 KeyError.
     _ORPHAN_UPDATE_KEYS = {
         "class", "status", "md5", "size", "twin_path", "trash_path",
         "error", "classified_at", "resolved_at",
+        # P14 — B 후보 기록
+        "candidate_size", "candidate_reason", "candidates_json",
     }
 
     def orphan_upsert_from_job(self, job: dict) -> int:
@@ -1063,11 +1070,15 @@ class Store:
         klass: str = "",
         search: str = "",
         order: str = "desc",
+        group: str = "",
     ) -> dict:
         """§3.4 — 고아 목록. list_page 와 대칭 키.
 
-        반환: items, page, page_size, pages, total,
-        counts: {status: n, ...}, class_counts: {A:n,B:n,C:n,"":n}.
+        `group=='folder'` 이면 **폴더 단위 페이징**(folders). 그 외(기본 '') 는 오늘과
+        동일한 평평한 items — 단위 테스트가 이걸 쓴다.
+        반환 공통: items, page, page_size, pages, total, counts, class_counts.
+        group=folder 추가 키: folders: [Folder], folder_total.
+        pages 는 folder_total 기준, total 은 (필터 후) 행 수를 유지해 배지와 안 싸운다.
         쿼리 파라미터 이름은 `class` (klass 는 파이썬 인자명).
         """
         try:
@@ -1100,8 +1111,11 @@ class Store:
             )
             params.extend([pat, pat, pat])
         where_sql = " AND ".join(where_parts)
-        order_sql = "ORDER BY id ASC" if order_asc else "ORDER BY id DESC"
 
+        if str(group or "") == "folder":
+            return self._orphan_list_by_folder(page, page_size, where_sql, params, order_asc)
+
+        order_sql = "ORDER BY id ASC" if order_asc else "ORDER BY id DESC"
         rows: list[dict] = []
         total = 0
         try:
@@ -1122,6 +1136,28 @@ class Store:
             total = 0
 
         pages = (total + page_size - 1) // page_size if total else 0
+        counts, class_counts = self._orphan_counts()
+        return {
+            "items": rows, "page": page, "page_size": page_size,
+            "pages": pages, "total": total,
+            "counts": counts, "class_counts": class_counts,
+        }
+
+    @staticmethod
+    def _orphan_folder_counts(items: list[dict]) -> dict:
+        """§3.4 — 그 폴더의 **현재 WHERE 에 걸린** 행 기준 counts. (필터=B 면 C 는 0)"""
+        out = {"pending": 0, "B": 0, "C": 0, "isolated": 0,
+               "kept": 0, "missing": 0, "failed": 0}
+        for r in items:
+            st = str(r.get("status") or "")
+            cl = str(r.get("class") or "")
+            if st in out:
+                out[st] += 1
+            if cl in ("B", "C"):
+                out[cl] += 1
+        return out
+
+    def _orphan_counts(self) -> tuple[dict, dict]:
         counts: dict = {}
         class_counts: dict = {}
         try:
@@ -1140,10 +1176,59 @@ class Store:
                 }
         except Exception:
             pass
+        return counts, class_counts
 
+    def _orphan_list_by_folder(
+        self, page: int, page_size: int, where_sql: str, params: list, order_asc: bool
+    ) -> dict:
+        """§3.4 / §0.5 — parent_dir 로 묶어 폴더 단위로 페이징한다.
+
+        같은 parent_dir 의 행은 **절대 페이지로 쪼개지지 않는다** — 시리즈 판단이 한
+        화면에서 끝나야 하기 때문. 폴더 정렬은 MAX(id) 기준 (최근 고아가 있는 시리즈 위).
+        """
+        rows: list[dict] = []
+        try:
+            with self._reader() as conn:
+                cur = conn.execute(f"SELECT * FROM orphan WHERE {where_sql}", params)
+                rows = [dict(r) for r in cur.fetchall()]
+        except Exception:
+            rows = []
+        grouped: dict[str, list[dict]] = {}
+        for r in rows:
+            grouped.setdefault(str(r.get("parent_dir") or ""), []).append(r)
+        ordered = sorted(
+            grouped.items(),
+            key=lambda kv: max(int(x["id"]) for x in kv[1]),
+            reverse=not order_asc,
+        )
+        folder_total = len(ordered)
+        pages = (folder_total + page_size - 1) // page_size if folder_total else 0
+        offset = (page - 1) * page_size
+        page_folders = ordered[offset:offset + page_size]
+        folders: list[dict] = []
+        flat_items: list[dict] = []
+        for pdir, items in page_folders:
+            items_sorted = sorted(
+                items, key=lambda r: (str(r.get("name") or ""), int(r["id"]))
+            )
+            pending_ids = [
+                int(r["id"]) for r in items_sorted
+                if (r.get("status") == "pending" and r.get("class") in ("B", "C"))
+            ]
+            folders.append({
+                "parent_dir": pdir,
+                "name": os.path.basename(pdir) if pdir else "",
+                "pending_ids": pending_ids,
+                "counts": self._orphan_folder_counts(items_sorted),
+                "items": items_sorted,
+            })
+            flat_items.extend(items_sorted)
+        counts, class_counts = self._orphan_counts()
         return {
-            "items": rows, "page": page, "page_size": page_size,
-            "pages": pages, "total": total,
+            "items": flat_items, "folders": folders,
+            "folder_total": folder_total,
+            "page": page, "page_size": page_size, "pages": pages,
+            "total": len(rows),
             "counts": counts, "class_counts": class_counts,
         }
 
@@ -1161,6 +1246,22 @@ class Store:
                 "SELECT * FROM orphan WHERE status='pending' ORDER BY id ASC"
             )
             return [dict(r) for r in cur.fetchall()]
+
+    def orphan_ids_pending_in_parent(self, parent_dir: str) -> list[int]:
+        """P14 §3.4 — 그 폴더의 pending B/C id (id ASC). 폴더 단위 일괄 처리용.
+
+        parent_dir 은 DB 에 저장된 절대경로 완전일치. 빈 문자열이면 [].
+        """
+        if not parent_dir:
+            return []
+        with self._reader() as conn:
+            cur = conn.execute(
+                """SELECT id FROM orphan
+                    WHERE status='pending' AND class IN ('B','C') AND parent_dir=?
+                    ORDER BY id ASC""",
+                (parent_dir,),
+            )
+            return [int(r["id"]) for r in cur.fetchall()]
 
     def orphan_update(self, orphan_id: int, **fields) -> None:
         """§3.4 — 허용 키만 기록. 그 외 KeyError. 빈 fields 면 no-op."""

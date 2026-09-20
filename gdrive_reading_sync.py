@@ -121,6 +121,51 @@ def _normpath_eq(a: str, b: str) -> bool:
     )
 
 
+def _hydrate_orphan_row(row: dict) -> None:
+    """P14 §3.4 — candidates_json 원문을 `candidates` 리스트로 바꾼다.
+
+    파싱 실패/부재 시 `[]`. JS 는 `candidates` 만 읽는다 (원문 문자열은 안 내려도 된다).
+    """
+    raw = row.pop("candidates_json", None)
+    try:
+        parsed = json.loads(raw) if raw else []
+        row["candidates"] = parsed if isinstance(parsed, list) else []
+    except Exception:
+        row["candidates"] = []
+
+
+def _list_other_files(parent_dir: str, exclude_names: set, limit: int = 30) -> tuple[list, int]:
+    """P14 §3.5 — 그 폴더의 파일(디렉터리 제외) 중 고아가 아닌 것의 이름·크기.
+
+    라우트(웹 스레드)가 listdir 한다 — Store 는 디스크를 열지 않는다. **해시 금지**
+    (stat 만). 상한 limit, 초과분은 개수로. OSError 면 `([], 0)`.
+    """
+    if not parent_dir:
+        return [], 0
+    out: list[dict] = []
+    more = 0
+    try:
+        entries = sorted(os.scandir(parent_dir), key=lambda e: e.name.lower())
+    except OSError:
+        return [], 0
+    for e in entries:
+        try:
+            if not e.is_file() or e.name in exclude_names:
+                continue
+        except OSError:
+            continue
+        rec = {"name": e.name, "size": 0}
+        try:
+            rec["size"] = int(e.stat().st_size)
+        except OSError:
+            pass
+        if len(out) < limit:
+            out.append(rec)
+        else:
+            more += 1
+    return out, more
+
+
 class _DailyTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
     """**로컬** 자정마다 회전. 활성 파일명 `gdrive_reading_sync.log`,
     회전본은 `gdrive_reading_sync_<YYYYMMDD>.log`.
@@ -636,6 +681,15 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
                     f"classified={bf.get('classified')}")
         except Exception as exc:
             log_exc(f"[{SELF_ID}] orphan backfill failed")
+        # P14 §3.7 — 기동 시 pending 재분류 1회 (백필 가드와 무관). 기존 128 B 의
+        # twin_path/candidate_* 를 채우는 트리거다. 멱등 UPDATE, 새 플래그 없음.
+        # 늦은 create 로 C/B 가 A 로 올라가는 v0.4.0 동작은 copy 루프가 계속 맡는다.
+        try:
+            cls0 = classify_pending_orphans(store, cfg0, log=log)
+            if cls0.get("classified"):
+                log(f"[{SELF_ID}] orphan classify: {cls0}")
+        except Exception as exc:
+            log_exc(f"[{SELF_ID}] orphan startup classify failed")
         try:
             self._refresh_remote_options(cfg0)
         except Exception as exc:
@@ -1082,7 +1136,12 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
         })
 
     def _route_orphans(self):
-        """P13 §3.6 — 정리 대기(고아) 목록. 쿼리: page,page_size,status,class,search,order."""
+        """P14 §3.5 — 정리 대기(고아) 목록.
+
+        쿼리: page,page_size,status,class,search,order,group.
+        `group=folder` 이면 폴더 묶기 + 페이지에 보이는 폴더의 `others`(고아가 아닌
+        이웃 파일 이름·크기)를 listdir 로 붙인다 (Store 는 디스크를 열지 않는다).
+        """
         from flask import request
         store = open_store(__file__)
         resp = store.orphan_list_page(
@@ -1092,7 +1151,25 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
             klass=request.args.get("class", default=""),
             search=request.args.get("search", default=""),
             order=request.args.get("order", default="desc"),
+            group=request.args.get("group", default=""),
         )
+        # candidates_json → candidates (라우트가 파싱; 실패 시 []).
+        for row in resp.get("items") or []:
+            _hydrate_orphan_row(row)
+        if isinstance(resp.get("folders"), list):
+            for folder in resp["folders"]:
+                items = folder.get("items") or []
+                for row in items:
+                    _hydrate_orphan_row(row)
+                exclude = {
+                    os.path.basename(str(r.get("local_path") or "")) for r in items
+                }
+                others, more = _list_other_files(
+                    folder.get("parent_dir") or "", exclude
+                )
+                folder["others"] = others
+                if more:
+                    folder["others_more"] = more
         resp["success"] = True
         return jsonify(resp)
 
@@ -1105,9 +1182,12 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
         return self._orphans_bulk(action="keep")
 
     def _orphans_bulk(self, *, action: str):
-        """§3.6 — ids 검증 후 isolate/keep. 부분 실패는 200 + rejected_ids (409 아님).
+        """§3.5 — ids ∪ parent_dir 검증 후 isolate/keep. 부분 실패는 200 + rejected_ids.
 
         pending 이고 class in (B,C) 인 것만 처리. A/isolated/kept/missing/failed 는 거부.
+        `parent_dir` 가 있으면 그 폴더의 pending B/C id 를 ids 에 합친다 (중복 제거).
+        파일 이동은 항상 `orphan_get(id).local_path` 기준 — parent_dir 로 임의 경로를
+        replace 하지 않는다.
         """
         from flask import request
         store = open_store(__file__)
@@ -1117,18 +1197,41 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
             return jsonify({"success": False, "error": "json_body_required"}), 400
         if not isinstance(payload, dict):
             return jsonify({"success": False, "error": "json_body_required"}), 400
-        ids = payload.get("ids")
-        if not isinstance(ids, list):
+        raw_ids = payload.get("ids")
+        if raw_ids is None:
+            raw_ids = []
+        if not isinstance(raw_ids, list):
             return jsonify({"success": False, "error": "ids_list_required"}), 400
+        parent_dir = str(payload.get("parent_dir") or "")
+
+        merged: list = []
+        seen: set = set()
+        for raw in raw_ids:
+            try:
+                v = int(raw)
+            except (TypeError, ValueError):
+                merged.append(raw)   # 아래 루프에서 rejected 로
+                continue
+            if v not in seen:
+                seen.add(v)
+                merged.append(v)
+        if parent_dir:
+            for oid in store.orphan_ids_pending_in_parent(parent_dir):
+                if oid not in seen:
+                    seen.add(oid)
+                    merged.append(oid)
+        if not merged:
+            return jsonify({"success": False, "error": "ids_or_parent_required"}), 400
+
         cfg = self._cfg("general")
         done = 0
         rejected: list = []
         results: list = []
-        for raw in ids:
+        for item in merged:
             try:
-                oid = int(raw)
+                oid = int(item)
             except (TypeError, ValueError):
-                rejected.append(raw)
+                rejected.append(item)
                 continue
             row = store.orphan_get(oid)
             if (row is None or row.get("status") != "pending"
@@ -1162,7 +1265,7 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
                                 "error": res.get("error") or ""})
                 rejected.append(oid)
         return jsonify({
-            "success": True, "requested": len(ids), "done": done,
+            "success": True, "requested": len(merged), "done": done,
             "rejected_ids": rejected, "results": results,
         })
 
