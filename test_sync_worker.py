@@ -3445,6 +3445,472 @@ def test_T_IDLE_error_cycle_is_never_collapsed():
     print("  OK T-IDLE 오류 사이클은 접지 않는다")
 
 
+# ============================================================================
+# P13 — 고아 파일 격리 + 보관함 여러줄 경로 (v0.4.0)
+# ============================================================================
+# 원칙: 영구 삭제 금지. _trash 로 os.replace 이동만. 크로스 볼륨은 failed.
+# A 등급만 자동. shutil.move 금지. T-P13-NODEL 이 정적으로 강제한다.
+
+def _orphan_file(tmp_root: Path, rel: str, payload: bytes) -> Path:
+    p = tmp_root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(payload)
+    return p
+
+
+def test_T_P13_1_delete_before_d1_keeps_file():
+    """T-P13-1 — delete 분기가 D1 보다 먼저. job 에 md5 가 있어도 remote_deleted,
+    duplicate 가 아니고 원본 파일이 남는다."""
+    tmp = Path(tempfile.mkdtemp())
+    local_root = tmp / "READING"
+    payload = b"ORPHAN_CONTENT"
+    orphan = _orphan_file(local_root, "만화/책/old.zip", payload)
+    md5 = _file_bytes_md5(payload)
+    store = _store()
+    _seed_job(
+        store, event_key="ek:p13-del", action="delete", item_type="file",
+        remote_path="만화/책/old.zip", removed_path="만화/책/old.zip",
+        local_path=str(orphan), size=len(payload), md5=md5,
+    )
+    cfg = dict(CFG, LOCAL_ROOT=str(local_root))
+    claimed = store.claim_jobs(limit=1, max_attempts=3)
+    fake = _FakeRclone()
+    out = process_job(store, claimed[0], cfg, run_rclone=fake, tmp_root=tmp,
+                      log=lambda *a: None)
+    assert out["status"] == "skipped", out
+    assert out["result"] == "remote_deleted", out   # duplicate 면 D1 이 삼킨 것
+    assert orphan.is_file(), "원본 파일이 사라졌다 — 영구삭제/이동 발생"
+    assert fake.calls == [], fake.calls
+    print("  OK T-P13-1 delete 가 D1 앞 → remote_deleted, 원본 유지")
+
+
+def test_T_P13_2_delete_creates_orphan_pending():
+    """T-P13-2 — delete 처리 후 orphan pending 1행, local_path/parent_dir 일치.
+    job.status 는 기존 skipped."""
+    tmp = Path(tempfile.mkdtemp())
+    local_root = tmp / "READING"
+    orphan = _orphan_file(local_root, "만화/책/old.zip", b"X")
+    store = _store()
+    _seed_job(
+        store, event_key="ek:p13-del2", action="delete", item_type="file",
+        remote_path="만화/책/old.zip", local_path=str(orphan), size=1, md5="",
+    )
+    cfg = dict(CFG, LOCAL_ROOT=str(local_root))
+    claimed = store.claim_jobs(limit=1, max_attempts=3)
+    process_job(store, claimed[0], cfg, run_rclone=_FakeRclone(), tmp_root=tmp,
+                log=lambda *a: None)
+    rows = store.orphan_pending()
+    assert len(rows) == 1, rows
+    assert rows[0]["local_path"] == str(orphan), rows[0]
+    assert rows[0]["parent_dir"] == str(orphan.parent), rows[0]
+    jobs = {j["event_key"]: j for j in store.read_jobs(limit=10)["jobs"]}
+    assert jobs["ek:p13-del2"]["status"] == "skipped", jobs["ek:p13-del2"]
+    print("  OK T-P13-2 delete → orphan pending 1행 + job skipped")
+
+
+def test_T_P13_3_same_cycle_delete_create_classifies_A_and_isolates():
+    """T-P13-3 — 같은 사이클 delete+create: 분류하면 A, 고아는 _trash 로 이동,
+    twin 은 원래 자리에 남는다."""
+    tmp = Path(tempfile.mkdtemp())
+    local_root = tmp / "READING"
+    payload = b"DUP_CONTENT"
+    md5 = _file_bytes_md5(payload)
+    orphan = _orphan_file(local_root, "만화/책/old.zip", payload)
+    twin = _orphan_file(local_root, "만화/책/new (리디).zip", payload)  # 같은 md5
+    store = _store()
+    # delete job 먼저 (낮은 id) → create job (D1 duplicate 로 끝남)
+    _seed_job(
+        store, event_key="ek:p13:c1", action="delete", item_type="file",
+        remote_path="만화/책/old.zip", local_path=str(orphan),
+        size=len(payload), md5=md5,
+    )
+    _seed_job(
+        store, event_key="ek:p13:c2", action="create", item_type="file",
+        remote_path="만화/책/new (리디).zip", local_path=str(twin),
+        size=len(payload), md5=md5,
+    )
+    cfg = dict(CFG, LOCAL_ROOT=str(local_root), PARALLEL_TRANSFERS=1,
+               JOBS_PER_CYCLE=10, MAX_ATTEMPTS=3)
+    process_jobs(store, cfg, run_rclone=_FakeRclone(), log=lambda *a: None)
+    assert orphan.is_file(), "분류 전에 고아가 사라졌다"
+
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    summary = classify_pending_orphans(store, cfg, log=lambda *a: None)
+    assert summary["isolated"] == 1, summary
+    assert not orphan.exists(), "고아가 _trash 로 안 옮겨짐"
+    assert twin.is_file(), "twin 이 사라졌다"
+    row = store.orphan_list_page()["items"][0]
+    assert row["class"] == "A", row
+    assert row["status"] == "isolated", row
+    assert row["trash_path"] and "_trash" in row["trash_path"], row
+    assert os.path.isfile(row["trash_path"]), row
+    assert str(twin) == row["twin_path"], row
+    print("  OK T-P13-3 같은 사이클 delete+create → A 격리, twin 유지")
+
+
+def test_T_P13_4_delete_only_is_C_and_no_move():
+    """T-P13-4 — create 없이 delete 만: C (또는 이름 유사면 B), 파일 이동 안 함."""
+    tmp = Path(tempfile.mkdtemp())
+    local_root = tmp / "READING"
+    orphan = _orphan_file(local_root, "만화/책/only.zip", b"ONLY_CONTENT")
+    store = _store()
+    _seed_job(
+        store, event_key="ek:p13:only", action="delete", item_type="file",
+        remote_path="만화/책/only.zip", local_path=str(orphan), size=12, md5="",
+    )
+    cfg = dict(CFG, LOCAL_ROOT=str(local_root), PARALLEL_TRANSFERS=1)
+    process_jobs(store, cfg, run_rclone=_FakeRclone(), log=lambda *a: None)
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    summary = classify_pending_orphans(store, cfg, log=lambda *a: None)
+    assert summary["pending_bc"] == 1, summary
+    assert summary["isolated"] == 0, summary
+    assert orphan.is_file(), "B/C 인데 파일이 이동됨"
+    row = store.orphan_list_page()["items"][0]
+    assert row["class"] in ("B", "C"), row
+    assert row["status"] == "pending", row
+    print("  OK T-P13-4 delete 만 → B/C, 이동 없음")
+
+
+def test_T_P13_5_similar_name_diff_md5_is_B():
+    """T-P13-5 — 이름만 비슷하고 md5 다름 → B, 이동 없음."""
+    tmp = Path(tempfile.mkdtemp())
+    orphan = _orphan_file(tmp, "만화/책/01권#164.zip", b"A" * 40)
+    _orphan_file(tmp, "만화/책/01권 (리디)#164.zip", b"B" * 40)   # 같은 size, 다른 내용
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_orphan
+    v = classify_orphan({"local_path": str(orphan), "id": 1})
+    assert v["class"] == "B", v
+    assert orphan.is_file()
+    print("  OK T-P13-5 이름 유사 + md5 다름 → B")
+
+
+def test_T_P13_6_hash164_token_shared_is_B():
+    """T-P13-6 — `#164` 토큰 공유 + 다른 본문 → B."""
+    tmp = Path(tempfile.mkdtemp())
+    orphan = _orphan_file(tmp, "책/전생 왕녀 01권#164.zip", b"A" * 30)
+    _orphan_file(tmp, "책/전혀 다른 제목#164.zip", b"B" * 7)   # size 다름
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_orphan
+    v = classify_orphan({"local_path": str(orphan), "id": 1})
+    assert v["class"] == "B", v
+    print("  OK T-P13-6 #164 토큰 공유 → B")
+
+
+def test_T_P13_7_isolate_name_collision_uses_id_suffix():
+    """T-P13-7 — isolate 충돌 시 `.id{N}` 접미사로 성공, 원본 사라짐, dest 존재."""
+    import time as _t
+    tmp = Path(tempfile.mkdtemp())
+    local_root = tmp / "READING"
+    orphan = _orphan_file(local_root, "만화/책/old.zip", b"COLLIDE")
+    # dest 자리를 미리 점유한다 (오늘 날짜 폴더).
+    day = _t.strftime("%Y-%m-%d", _t.localtime())
+    collide = local_root / "_trash" / day / "만화" / "책" / "old.zip"
+    collide.parent.mkdir(parents=True, exist_ok=True)
+    collide.write_bytes(b"PREEXISTING")
+    cfg = dict(CFG, LOCAL_ROOT=str(local_root))
+    from plugins.metadata.gdrive_reading_sync.sync_worker import isolate_orphan
+    res = isolate_orphan({}, {"id": 12, "local_path": str(orphan)}, cfg,
+                         log=lambda *a: None)
+    assert res["status"] == "isolated", res
+    assert res["trash_path"].endswith("old.zip.id12"), res
+    assert os.path.isfile(res["trash_path"]), res
+    assert not orphan.exists(), "원본이 사라져야 한다 (이동)"
+    assert collide.read_bytes() == b"PREEXISTING", "기존 충돌 파일을 덮었다"
+    print("  OK T-P13-7 충돌 → .id12 접미사, 원본 사라짐, 기존 파일 보존")
+
+
+def test_T_P13_8_cross_volume_fails_and_keeps_src():
+    """T-P13-8 — os.replace 가 EXDEV 면 status=failed, src 유지, shutil.move 호출 0."""
+    import errno
+    import unittest.mock as _mock
+    from plugins.metadata.gdrive_reading_sync import sync_worker as _sw
+    tmp = Path(tempfile.mkdtemp())
+    local_root = tmp / "READING"
+    orphan = _orphan_file(local_root, "만화/책/old.zip", b"CROSSVOL")
+    cfg = dict(CFG, LOCAL_ROOT=str(local_root))
+
+    def _boom(src, dst):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    moved = {"n": 0}
+    with _mock.patch.object(_sw.os, "replace", side_effect=_boom), \
+         _mock.patch.object(_sw.shutil, "move",
+                            side_effect=lambda *a, **k: moved.__setitem__("n", moved["n"] + 1)):
+        res = _sw.isolate_orphan({}, {"id": 3, "local_path": str(orphan)}, cfg,
+                                 log=lambda *a: None)
+    assert res["status"] == "failed", res
+    assert "cross_volume" in res["error"], res
+    assert orphan.is_file(), "EXDEV 인데 원본이 사라졌다"
+    assert moved["n"] == 0, "shutil.move 를 호출했다 (영구삭제 위험)"
+    print("  OK T-P13-8 EXDEV → failed, 원본 유지, shutil.move 0")
+
+
+def test_T_P13_9_backfill_idempotent_with_guard():
+    """T-P13-9 — 백필: remote_deleted 2행 → orphan 2. 두 번째는 skipped_done, 행 수 불변."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import backfill_remote_deleted_orphans
+    store = _store()
+    cfg = dict(CFG, LOCAL_ROOT=str(Path(tempfile.mkdtemp())))
+    for i, rel in enumerate(("만화/a/1.zip", "만화/b/2.zip"), start=1):
+        _seed_job(store, event_key=f"ek:bf:{i}", action="delete", item_type="file",
+                  remote_path=rel, local_path=f"T:/LIBRARY/{rel}", size=5, md5="")
+        rows = {j["event_key"]: j for j in store.read_jobs(limit=10)["jobs"]}
+        store.finish_job(rows[f"ek:bf:{i}"]["id"], "skipped",
+                         result="remote_deleted", bytes_done=0)
+    # 정확히 2행이 remote_deleted 인지 확인
+    assert len(store.orphan_backfill_jobs()) == 2, store.orphan_backfill_jobs()
+    out1 = backfill_remote_deleted_orphans(store, cfg, log=lambda *a: None)
+    assert out1["inserted"] == 2, out1
+    assert out1["skipped_done"] == 0, out1
+    n1 = store.orphan_list_page()["total"]
+    assert n1 == 2, n1
+    out2 = backfill_remote_deleted_orphans(store, cfg, log=lambda *a: None)
+    assert out2["skipped_done"] == 1, out2
+    assert store.orphan_list_page()["total"] == n1, "두 번째 백필이 행을 바꿨다"
+    print("  OK T-P13-9 백필 멱등 + 가드")
+
+
+def test_T_P13_10_cleanup_terminal_keeps_orphans():
+    """T-P13-10 — cleanup_terminal(delete_all=True) 이 job 을 지워도 orphan 행은 남는다."""
+    store = _store()
+    _seed_job(store, event_key="ek:cut:1", action="delete", item_type="file",
+              remote_path="만화/a/1.zip", local_path="T:/LIBRARY/만화/a/1.zip",
+              size=5, md5="")
+    jid = store.read_jobs(limit=10)["jobs"][0]["id"]
+    store.finish_job(jid, "skipped", result="remote_deleted", bytes_done=0)
+    store.orphan_upsert_from_job(store.read_jobs(limit=10)["jobs"][0])
+    assert store.orphan_list_page()["total"] == 1
+    deleted = store.cleanup_terminal(retention_days=30, delete_all=True)
+    assert deleted == 1, deleted
+    assert store.read_jobs(limit=10)["total"] == 0, "job 이 안 지워짐"
+    assert store.orphan_list_page()["total"] == 1, "orphan 이 job 과 함께 지워졌다"
+    print("  OK T-P13-10 job 정리해도 orphan 은 남는다")
+
+
+def test_T_P13_11_pick_library_multiline():
+    """T-P13-11 — 여러줄 physical_path: 둘째 줄 아래 폴더가 그 보관함,
+    반환 3번째 값은 맞은 단일 경로(여러줄 아님)."""
+    import plugins.metadata.gdrive_reading_sync.gdrive_reading_sync as _g
+    root = Path(tempfile.mkdtemp())
+    a = str(root / "L_a")
+    b = str(root / "L_b")
+    libs = [("general", 5, a + "\n" + b)]
+    hit = _g._pick_library(libs, str(Path(b) / "책" / "폴더"))
+    assert hit == ("general", 5, b), hit
+    # 맞은 한 줄과는 equal, 원문 여러줄과는 not equal
+    assert _g._normpath_eq(b, hit[2]) is True
+    assert _g._normpath_eq(a + "\n" + b, hit[2]) is False
+    print("  OK T-P13-11 여러줄 physical_path → 맞은 단일 경로 반환")
+
+
+def test_T_P13_12_T_AS1_single_path_regression():
+    """T-P13-12 — T-AS1 기존 단언 재실행 (단일 경로 회귀)."""
+    test_T_AS1_pick_library_deepest_match()
+    print("  OK T-P13-12 T-AS1 단일 경로 회귀 유지")
+
+
+def test_T_P13_13_split_physical_paths():
+    """T-P13-13 — `\\r\\n`·빈 줄·공백 줄을 본체와 같이 버린다."""
+    import plugins.metadata.gdrive_reading_sync.gdrive_reading_sync as _g
+    got = _g._split_physical_paths("L:\\a\r\n\r\n   \n  L:\\b  \n")
+    assert got == ["L:\\a", "L:\\b"], got
+    assert _g._split_physical_paths("") == []
+    assert _g._split_physical_paths(None) == []
+    print("  OK T-P13-13 _split_physical_paths (\\r\\n/빈줄/공백 버림)")
+
+
+def test_T_P13_14_purge_expired_trash_only_dated_folders():
+    """T-P13-14 — 31일 전 날짜 폴더 파일 unlink, 29일 전 생존,
+    _trash/.bookoasisignore 생존, LOCAL_ROOT 직하 일반 파일 생존."""
+    import datetime as _dt
+    from plugins.metadata.gdrive_reading_sync.sync_worker import purge_expired_trash
+    local_root = Path(tempfile.mkdtemp()) / "READING"
+    trash = local_root / "_trash"
+    old_day = (_dt.date.today() - _dt.timedelta(days=31)).strftime("%Y-%m-%d")
+    new_day = (_dt.date.today() - _dt.timedelta(days=29)).strftime("%Y-%m-%d")
+    (trash / old_day / "만화").mkdir(parents=True, exist_ok=True)
+    old_file = trash / old_day / "만화" / "gone.zip"
+    old_file.write_bytes(b"OLD")
+    (trash / new_day).mkdir(parents=True, exist_ok=True)
+    keep_file = trash / new_day / "keep.zip"
+    keep_file.write_bytes(b"KEEP")
+    ignore = trash / ".bookoasisignore"
+    ignore.write_text("*\n", encoding="utf-8")
+    root_file = local_root / "rootfile.zip"
+    root_file.write_bytes(b"ROOT")
+
+    n = purge_expired_trash(local_root, 30, log=lambda *a: None)
+    assert n == 1, n
+    assert not old_file.exists(), "31일 전 파일이 안 지워짐"
+    assert keep_file.is_file(), "29일 전 파일이 지워짐"
+    assert ignore.is_file(), ".bookoasisignore 가 지워짐"
+    assert root_file.is_file(), "LOCAL_ROOT 직하 파일이 지워짐"
+    assert purge_expired_trash(None, 30) == 0
+    print("  OK T-P13-14 purge: 31일 전만 unlink, 나머지 보존")
+
+
+def test_T_P13_15_auto_cleanup_off_no_purge():
+    """T-P13-15 — AUTO_CLEANUP off 면 _cleanup_if_due 가 purge 를 호출하지 않는다."""
+    import unittest.mock as _mock
+    import plugins.metadata.gdrive_reading_sync.gdrive_reading_sync as _g
+    store = _store()
+    provider = GdriveReadingSyncMetadataProvider()
+    calls = {"n": 0}
+
+    def _count(local_root, rd, *, log=print):
+        calls["n"] += 1
+        return 0
+
+    with _mock.patch.object(_g, "purge_expired_trash", side_effect=_count):
+        provider._cleanup_if_due(store, {"AUTO_CLEANUP": False, "RETENTION_DAYS": 30},
+                                 now_monotonic=1e9)
+        assert calls["n"] == 0, "AUTO_CLEANUP off 인데 purge 호출"
+        provider._last_cleanup_monotonic = 0.0
+        provider._cleanup_if_due(store, {"AUTO_CLEANUP": True, "RETENTION_DAYS": 30},
+                                 now_monotonic=1e9)
+        assert calls["n"] == 1, "AUTO_CLEANUP on 인데 purge 미호출"
+    print("  OK T-P13-15 AUTO_CLEANUP off → purge 미호출")
+
+
+def test_T_P13_16_isolate_triggers_scan_touch():
+    """T-P13-16 — isolate 성공 후 parent_dir 이 scan pending 으로 들어간다."""
+    import unittest.mock as _mock
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    local_root = Path(tempfile.mkdtemp()) / "READING"
+    payload = b"SCANTOUCH"
+    orphan = _orphan_file(local_root, "만화/책/old.zip", payload)
+    _orphan_file(local_root, "만화/책/new.zip", payload)   # twin → A
+    store = _store()
+    store.orphan_upsert_from_job({"id": 1, "file_id": "f", "local_path": str(orphan),
+                                  "size": len(payload), "md5": "", "remote_path": ""})
+    cfg = dict(CFG, LOCAL_ROOT=str(local_root))
+    with _mock.patch.object(
+        GdriveReadingSyncMetadataProvider, "_all_libraries",
+        staticmethod(lambda log=print: [("general", 7, str(local_root))]),
+    ):
+        summary = classify_pending_orphans(store, cfg, log=lambda *a: None)
+    assert summary["isolated"] == 1, summary
+    m = store.scan_map([str(orphan.parent)])
+    assert str(orphan.parent) in m, m
+    assert m[str(orphan.parent)]["status"] == "pending", m
+    print("  OK T-P13-16 isolate → parent_dir scan pending")
+
+
+def test_T_P13_17_keep_api_marks_kept():
+    """T-P13-17 — keep: pending B → kept, 파일 위치 불변."""
+    import unittest.mock as _mock
+    import plugins.metadata.gdrive_reading_sync.gdrive_reading_sync as _g
+    local_root = Path(tempfile.mkdtemp()) / "READING"
+    orphan = _orphan_file(local_root, "만화/책/sim#9.zip", b"KEEPME")
+    store = _store()
+    oid = store.orphan_upsert_from_job({"id": 1, "file_id": "f", "local_path": str(orphan),
+                                        "size": 6, "md5": "", "remote_path": ""})
+    store.orphan_update(oid, **{"class": "B"})   # pending B 로 만든다
+
+    class _Req:
+        def get_json(self, force=False, silent=False):
+            return {"ids": [oid]}
+
+    provider = GdriveReadingSyncMetadataProvider()
+    provider._cfg = lambda db_type="general": {"LOCAL_ROOT": str(local_root)}
+    flask_stub = sys.modules["flask"]
+    with _mock.patch.object(flask_stub, "request", _Req()), \
+         _mock.patch.object(_g, "open_store", return_value=store):
+        provider._route_orphans_keep()
+    row = store.orphan_get(oid)
+    assert row["status"] == "kept", row
+    assert orphan.is_file(), "kept 인데 파일이 이동/삭제됨"
+    print("  OK T-P13-17 keep → status=kept, 파일 불변")
+
+
+def test_T_P13_18_size_gate_skips_md5_of_other_sized_neighbor():
+    """T-P13-18 — size 다른 이웃은 md5_file 호출 0 (wrapper 카운터)."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_orphan
+    tmp = Path(tempfile.mkdtemp())
+    orphan = _orphan_file(tmp, "책/only.zip", b"A" * 20)
+    _orphan_file(tmp, "책/other.zip", b"B" * 5)   # size 다름 → 해시 금지
+    calls = {"n": 0}
+
+    def _md5(p):
+        calls["n"] += 1
+        return _file_bytes_md5(Path(p).read_bytes())
+
+    v = classify_orphan({"local_path": str(orphan), "id": 1}, md5_file_fn=_md5)
+    assert calls["n"] == 1, f"고아 1회만 해시해야 한다: {calls['n']}"
+    assert v["class"] in ("B", "C"), v
+    print("  OK T-P13-18 size 다른 이웃 해시 0 (고아만 1회)")
+
+
+def test_T_P13_19_missing_when_file_gone():
+    """T-P13-19 — local_path 없음 → status=missing, _trash 비어 있음."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    local_root = Path(tempfile.mkdtemp()) / "READING"
+    local_root.mkdir(parents=True, exist_ok=True)
+    gone = local_root / "만화" / "책" / "ghost.zip"   # 만들지 않는다
+    store = _store()
+    store.orphan_upsert_from_job({"id": 1, "file_id": "f", "local_path": str(gone),
+                                  "size": 1, "md5": "", "remote_path": ""})
+    cfg = dict(CFG, LOCAL_ROOT=str(local_root))
+    summary = classify_pending_orphans(store, cfg, log=lambda *a: None)
+    assert summary["missing"] == 1, summary
+    row = store.orphan_list_page()["items"][0]
+    assert row["status"] == "missing", row
+    trash = local_root / "_trash"
+    assert not trash.exists() or not any(trash.iterdir()), "missing 인데 _trash 가 생겼다"
+    print("  OK T-P13-19 파일 없음 → missing, _trash 비어 있음")
+
+
+def test_T_P13_NODEL_no_destructive_calls_outside_allowed():
+    """T-P13-NODEL — 정적: 영구삭제/이동 호출이 허용 함수 밖에 없어야 한다.
+
+    허용: _recover_tmp_files, _execute_prepared_copy(.part), purge_expired_trash.
+    isolate_orphan 본문에 unlink/move 가 있으면 fail. rclone 금지 동사 가드 유지도 본다.
+    """
+    import ast
+
+    allowed_fns = {"_recover_tmp_files", "_execute_prepared_copy", "purge_expired_trash"}
+    forbidden_attr = {"remove", "unlink", "rmtree", "move"}
+    root = Path(__file__).resolve().parent
+
+    def _calls_in(fn):
+        """nested 함수/람다 본문은 제외하고 이 함수 스코프의 Call 만 yield."""
+        stack = list(fn.body)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(node, ast.Call):
+                yield node
+            stack.extend(ast.iter_child_nodes(node))
+
+    def _target(call):
+        f = call.func
+        if isinstance(f, ast.Attribute):
+            base = f.value
+            if isinstance(base, ast.Name):
+                return f"{base.id}.{f.attr}"
+            return f".{f.attr}"
+        if isinstance(f, ast.Name):
+            return f.id
+        return ""
+
+    bad = []
+    for fname in ("sync_worker.py", "gdrive_reading_sync.py"):
+        tree = ast.parse((root / fname).read_text(encoding="utf-8"))
+        for fn in [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            for call in _calls_in(fn):
+                tgt = _target(call)
+                attr = tgt.rsplit(".", 1)[-1]
+                if attr in forbidden_attr:
+                    if fn.name not in allowed_fns:
+                        bad.append(f"{fname}:{fn.name}:{tgt}")
+    assert not bad, f"영구삭제/이동 호출이 허용 밖에 있다: {bad}"
+
+    # rclone 금지 동사 가드 유지
+    sw_src = (root / "sync_worker.py").read_text(encoding="utf-8")
+    assert "FORBIDDEN_RCLONE_VERBS" in sw_src
+    for verb in ("delete", "purge", "rmdirs", "deletefile"):
+        assert verb in sw_src, f"금지 동사 표식 사라짐: {verb}"
+    print("  OK T-P13-NODEL: 영구삭제/이동은 허용 함수 밖에 없다")
+
+
 if __name__ == "__main__":
     tests = [
         # 기존 6종 (1라운드 회귀)
@@ -3562,6 +4028,27 @@ if __name__ == "__main__":
         test_T_P10_7_rename_create_delete_preserved,
         test_T_P10_8_upsert_item_before_event_and_no_job_on_repeat,
         test_T_P10_9_get_item_roundtrip_size_md5,
+        # P13 — 고아 파일 격리 + 보관함 여러줄 경로 (v0.4.0) 신규
+        test_T_P13_1_delete_before_d1_keeps_file,
+        test_T_P13_2_delete_creates_orphan_pending,
+        test_T_P13_3_same_cycle_delete_create_classifies_A_and_isolates,
+        test_T_P13_4_delete_only_is_C_and_no_move,
+        test_T_P13_5_similar_name_diff_md5_is_B,
+        test_T_P13_6_hash164_token_shared_is_B,
+        test_T_P13_7_isolate_name_collision_uses_id_suffix,
+        test_T_P13_8_cross_volume_fails_and_keeps_src,
+        test_T_P13_9_backfill_idempotent_with_guard,
+        test_T_P13_10_cleanup_terminal_keeps_orphans,
+        test_T_P13_11_pick_library_multiline,
+        test_T_P13_12_T_AS1_single_path_regression,
+        test_T_P13_13_split_physical_paths,
+        test_T_P13_14_purge_expired_trash_only_dated_folders,
+        test_T_P13_15_auto_cleanup_off_no_purge,
+        test_T_P13_16_isolate_triggers_scan_touch,
+        test_T_P13_17_keep_api_marks_kept,
+        test_T_P13_18_size_gate_skips_md5_of_other_sized_neighbor,
+        test_T_P13_19_missing_when_file_gone,
+        test_T_P13_NODEL_no_destructive_calls_outside_allowed,
     ]
     for fn in tests:
         fn()

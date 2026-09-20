@@ -389,6 +389,57 @@
     flex-wrap: nowrap;
 }
 
+/* P13 §10 — 하위 탭 (변경 이벤트 / 정리 대기) */
+.gdrs-subtabs {
+    display: flex;
+    gap: 6px;
+    margin: 0 0 14px 0;
+    border-bottom: 1px solid var(--app-border-light);
+}
+.gdrs-subtab {
+    padding: 8px 16px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    background: transparent;
+    color: var(--app-text-muted);
+    font-size: 0.92rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+.gdrs-subtab:hover { color: var(--app-text-primary); }
+.gdrs-subtab.is-active {
+    color: var(--app-text-primary);
+    border-bottom-color: var(--app-accent);
+}
+.gdrs-tab-panel[hidden] { display: none; }
+
+/* P13 — 정리 대기 등급/상태 배지 */
+.gdrs-orphan-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: #ffffff;
+    background: #64748b;
+    white-space: nowrap;
+}
+.gdrs-orphan-class-A { background: #16a34a; }   /* 중복 → 자동 격리 */
+.gdrs-orphan-class-B { background: #f59e0b; }   /* 이름유사 → 사람 판단 */
+.gdrs-orphan-class-C { background: #94a3b8; }   /* 대체없음 → 기본 보존 */
+.gdrs-orphan-class-none { background: #475569; }
+.gdrs-orphan-status-pending { background: #f59e0b; }
+.gdrs-orphan-status-isolated { background: #2563eb; }
+.gdrs-orphan-status-kept { background: #64748b; }
+.gdrs-orphan-status-failed { background: #dc2626; }
+.gdrs-orphan-status-missing { background: #7c3aed; }
+.gdrs-name-cell {
+    max-width: 280px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .gdrs-pagination {
     display: flex;
     gap: 4px;

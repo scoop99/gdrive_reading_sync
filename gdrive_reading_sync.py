@@ -32,6 +32,13 @@ from .sync_worker import (
     recover_on_start,
     rewind_and_poll,
     process_jobs,
+    # P13 — 고아 격리
+    backfill_remote_deleted_orphans,
+    classify_pending_orphans,
+    purge_expired_trash,
+    isolate_orphan,
+    _scan_touch_after_isolate,
+    _local_root_path,
 )
 
 
@@ -57,24 +64,36 @@ PLUGIN_VERSION = _plugin_version()
 _WATCHED_SESSIONS = ("general", "adult", "audiobook", "video")
 
 
+def _split_physical_paths(physical_path: str) -> list[str]:
+    """§8 — BookOasis 보관함 physical_path 를 줄 단위 경로로 쪼갠다.
+
+    본체 스캐너와 같은 규칙 (tools/scanner/core.py:96) — `\\r` 제거 후 `\\n` 분리,
+    빈 줄/공백 줄 버림. 보관함 하나가 여러 경로(중복 보관)를 가질 수 있다.
+    """
+    return [p.strip() for p in str(physical_path or "").replace("\r", "").split("\n")
+            if p.strip()]
+
+
 def _pick_library(libraries: list, path: str):
     """`path` 를 품는 가장 깊은 라이브러리를 고른다. 없으면 None.
 
     libraries: `(session, library_id, physical_path)` 튜플 목록.
     중첩 등록(부모/자식 둘 다 라이브러리)일 때 자식이 이긴다 — 그래야
     새 파일이 실제로 보이는 라이브러리 하나만 스캔한다.
+
+    §8 — physical_path 는 여러 줄일 수 있다. 경로 **하나마다** 비교하고, 반환
+    튜플의 세 번째 값은 **맞은 단일 경로**다(원문 여러줄이 아니다). `_auto_scan`
+    의 `_normpath_eq(d, physical_path)` 가 라이브러리 루트 skip 에 이 값을 쓴다.
     """
     target = os.path.normcase(os.path.abspath(path))
     best = None
     best_len = -1
     for session, library_id, physical_path in libraries:
-        root = str(physical_path or "").strip()
-        if not root:
-            continue
-        root_n = os.path.normcase(os.path.abspath(root))
-        if target == root_n or target.startswith(root_n + os.sep):
-            if len(root_n) > best_len:
-                best, best_len = (session, library_id, root), len(root_n)
+        for root in _split_physical_paths(physical_path):
+            root_n = os.path.normcase(os.path.abspath(root))
+            if target == root_n or target.startswith(root_n + os.sep):
+                if len(root_n) > best_len:
+                    best, best_len = (session, library_id, root), len(root_n)
     return best
 
 
@@ -392,6 +411,15 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
                 log(f"[{SELF_ID}] cleanup: {deleted_scans} scan row(s) deleted (retention={rd})")
         except Exception as exc:
             log(f"[{SELF_ID}] scan_cleanup failed: {exc}")
+        # P13 §9 — `_trash/YYYY-MM-DD` 보존 정리. 같은 RETENTION_DAYS / 같은 1시간 gate.
+        # 이 분기는 AUTO_CLEANUP=true 일 때만 도달한다. 영구 삭제는 여기 한 곳뿐이며
+        # purge_expired_trash 가 `_trash` 날짜 폴더 안만 건드린다.
+        try:
+            purged = purge_expired_trash(_local_root_path(cfg), rd, log=log)
+            if purged:
+                log(f"[{SELF_ID}] cleanup: {purged} trash file(s) purged (retention={rd})")
+        except Exception as exc:
+            log(f"[{SELF_ID}] trash purge failed: {exc}")
         self._last_cleanup_monotonic = now_m
         if deleted:
             log(f"[{SELF_ID}] cleanup: {deleted} terminal job(s) deleted (retention={rd})")
@@ -599,6 +627,15 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
                 log(f"[{SELF_ID}] scan recover: {recovered_scans} running -> pending")
         except Exception as exc:
             log_exc(f"[{SELF_ID}] scan recover failed")
+        # P13 §7 — 과거 remote_deleted job 백필 1회 (가드). cleanup_terminal 이 지우기
+        # 전에 돌도록 startup·recover 다음에 둔다. 가드가 켜져 있으면 no-op.
+        try:
+            bf = backfill_remote_deleted_orphans(store, cfg0, log=log)
+            if not bf.get("skipped_done"):
+                log(f"[{SELF_ID}] orphan backfill: inserted={bf.get('inserted')} "
+                    f"classified={bf.get('classified')}")
+        except Exception as exc:
+            log_exc(f"[{SELF_ID}] orphan backfill failed")
         try:
             self._refresh_remote_options(cfg0)
         except Exception as exc:
@@ -652,6 +689,15 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
                                 out = process_jobs(store, cfg, log=log)
                                 if out.get("claimed"):
                                     log(f"[{SELF_ID}] process_jobs: {out}")
+                                # P13 §4 — 이 사이클의 delete(+create 착지)를 본 뒤 분류한다.
+                                # delete 이벤트 자리에서 판정하지 않는 이유(§0.1): 병렬 경로가
+                                # delete 를 copy 보다 먼저 직렬 처리해 그 시점엔 twin 이 없다.
+                                try:
+                                    cls = classify_pending_orphans(store, cfg, log=log)
+                                    if cls.get("classified"):
+                                        log(f"[{SELF_ID}] orphan classify: {cls}")
+                                except Exception as exc:
+                                    log_exc(f"[{SELF_ID}] orphan classify failed")
                                 self._auto_scan(
                                     cfg, out.get("landed_dirs") or [], store=store, log=log
                                 )
@@ -871,6 +917,10 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
                     "gdrs_retry": (f"{ROUTE_BASE}/retry", ["POST"]),
                     # §8 (S6) — 보존기간/정리
                     "gdrs_cleanup": (f"{ROUTE_BASE}/cleanup", ["POST"]),
+                    # P13 — 고아(정리 대기) 큐. 영구삭제 라우트는 없다.
+                    "gdrs_orphans": (f"{ROUTE_BASE}/orphans", ["GET"]),
+                    "gdrs_orphans_isolate": (f"{ROUTE_BASE}/orphans/isolate", ["POST"]),
+                    "gdrs_orphans_keep": (f"{ROUTE_BASE}/orphans/keep", ["POST"]),
                 }
                 registered = set(rule.endpoint for rule in app.url_map.iter_rules())
                 for endpoint, (path, methods) in routes.items():
@@ -1029,6 +1079,91 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
         return jsonify({
             "success": True, "deleted": deleted,
             "delete_all": delete_all, "retention_days": rd,
+        })
+
+    def _route_orphans(self):
+        """P13 §3.6 — 정리 대기(고아) 목록. 쿼리: page,page_size,status,class,search,order."""
+        from flask import request
+        store = open_store(__file__)
+        resp = store.orphan_list_page(
+            page=request.args.get("page", default=1, type=int),
+            page_size=request.args.get("page_size", default=50, type=int),
+            status=request.args.get("status", default=""),
+            klass=request.args.get("class", default=""),
+            search=request.args.get("search", default=""),
+            order=request.args.get("order", default="desc"),
+        )
+        resp["success"] = True
+        return jsonify(resp)
+
+    def _route_orphans_isolate(self):
+        """P13 §3.6 — 선택한 pending B/C 를 `_trash` 로 이동. A 는 이미 자동 처리됨."""
+        return self._orphans_bulk(action="isolate")
+
+    def _route_orphans_keep(self):
+        """P13 §3.6 — 선택한 pending B/C 를 보존(kept). 파일은 그대로."""
+        return self._orphans_bulk(action="keep")
+
+    def _orphans_bulk(self, *, action: str):
+        """§3.6 — ids 검증 후 isolate/keep. 부분 실패는 200 + rejected_ids (409 아님).
+
+        pending 이고 class in (B,C) 인 것만 처리. A/isolated/kept/missing/failed 는 거부.
+        """
+        from flask import request
+        store = open_store(__file__)
+        try:
+            payload = request.get_json(force=True, silent=False) or {}
+        except Exception:
+            return jsonify({"success": False, "error": "json_body_required"}), 400
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "json_body_required"}), 400
+        ids = payload.get("ids")
+        if not isinstance(ids, list):
+            return jsonify({"success": False, "error": "ids_list_required"}), 400
+        cfg = self._cfg("general")
+        done = 0
+        rejected: list = []
+        results: list = []
+        for raw in ids:
+            try:
+                oid = int(raw)
+            except (TypeError, ValueError):
+                rejected.append(raw)
+                continue
+            row = store.orphan_get(oid)
+            if (row is None or row.get("status") != "pending"
+                    or row.get("class") not in ("B", "C")):
+                rejected.append(oid)
+                continue
+            if action == "keep":
+                store.orphan_update(oid, status="kept", resolved_at=_iso_now())
+                results.append({"id": oid, "status": "kept"})
+                done += 1
+                continue
+            res = isolate_orphan(store, row, cfg, log=print)
+            if res["status"] == "isolated":
+                store.orphan_update(oid, status="isolated",
+                                    trash_path=res["trash_path"],
+                                    resolved_at=_iso_now())
+                _scan_touch_after_isolate(store, cfg, row.get("parent_dir"), log=print)
+                results.append({"id": oid, "status": "isolated",
+                                "trash_path": res["trash_path"]})
+                done += 1
+            elif res["status"] == "missing":
+                store.orphan_update(oid, status="missing",
+                                    error=res.get("error") or "file not found",
+                                    resolved_at=_iso_now())
+                results.append({"id": oid, "status": "missing"})
+                done += 1
+            else:
+                store.orphan_update(oid, status="failed",
+                                    error=res.get("error") or "isolate failed")
+                results.append({"id": oid, "status": "failed",
+                                "error": res.get("error") or ""})
+                rejected.append(oid)
+        return jsonify({
+            "success": True, "requested": len(ids), "done": done,
+            "rejected_ids": rejected, "results": results,
         })
 
     def _route_preflight(self):

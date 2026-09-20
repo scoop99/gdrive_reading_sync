@@ -29,10 +29,17 @@
     return { total, done, left, pct };
   }
 
+  // P13 §3.7 — 하위 탭 값은 events | orphans. 기본 events. 해시/쿼리 없이 메모리만
+  // (플러그인 webview 가 location 을 안 준다). DOM 을 만지지 않는 순수 함수.
+  const DEFAULT_TAB = "events";
+  function normalizeTab(tab) {
+    return tab === "orphans" ? "orphans" : DEFAULT_TAB;
+  }
+
   // 테스트용 export. new Function / 브라우저 스코프에는 module 이 없어
   // typeof 검사에서 단락 평가된다 (settings.js 와 같은 형태).
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { computeProgress };
+    module.exports = { computeProgress, normalizeTab, DEFAULT_TAB };
     return;
   }
 
@@ -42,6 +49,10 @@
   const API_PREFLIGHT = `/api/webhook/${PLUGIN_ID}/preflight`;
   const API_RETRY = `/api/webhook/${PLUGIN_ID}/retry`;
   const API_CLEANUP = `/api/webhook/${PLUGIN_ID}/cleanup`;
+  // P13 §3.7 — 고아(정리 대기) 큐. 영구삭제 라우트는 없다.
+  const API_ORPHANS = `/api/webhook/${PLUGIN_ID}/orphans`;
+  const API_ORPHANS_ISOLATE = `/api/webhook/${PLUGIN_ID}/orphans/isolate`;
+  const API_ORPHANS_KEEP = `/api/webhook/${PLUGIN_ID}/orphans/keep`;
 
   const $ = (id) => document.getElementById(id);
 
@@ -58,6 +69,17 @@
     total: 0,
     selected: new Set(),
     scans: {},   // P9 — /jobs 의 `scans` (folder 경로 -> scan row dict)
+    // P13 — 하위 탭 + 정리 대기(고아) 큐 상태
+    tab: DEFAULT_TAB,
+    orphanPage: 1,
+    orphanPageSize: 100,
+    orphanClass: "",
+    orphanStatus: "",
+    orphanSearch: "",
+    orphanOrder: "desc",
+    orphanPages: 0,
+    orphanTotal: 0,
+    orphanSelected: new Set(),
   };
 
   const STATUS_LABEL = {
@@ -97,6 +119,14 @@
     rename_source_missing: "원본부재",
     rename_candidates_multiple: "복수후보",
     safety_conflict: "충돌(안전)",
+  };
+
+  // P13 §3.7 — 고아 등급/상태 라벨. RESULT_LABEL 에 넣지 않는다 (고아는 job result 가
+  // 아니다). remote_deleted 라벨은 job 쪽에 그대로 유지.
+  const ORPHAN_CLASS_LABEL = { A: "중복(자동)", B: "이름유사", C: "대체없음" };
+  const ORPHAN_STATUS_LABEL = {
+    pending: "대기", isolated: "격리됨", kept: "보존",
+    failed: "실패", missing: "파일없음",
   };
 
   function fmtBytes(n) {
@@ -650,6 +680,179 @@
     }
   }
 
+  // ---- P13 — 정리 대기(고아) 탭 ------------------------------------------
+
+  async function loadOrphans(page) {
+    if (page) state.orphanPage = page;
+    state.orphanClass = $("gdrs-orphan-filter-class").value || "";
+    state.orphanStatus = $("gdrs-orphan-filter-status").value || "";
+    state.orphanSearch = $("gdrs-orphan-search").value.trim();
+    const params = new URLSearchParams();
+    params.set("page", String(state.orphanPage));
+    params.set("page_size", String(state.orphanPageSize));
+    if (state.orphanClass) params.set("class", state.orphanClass);
+    if (state.orphanStatus) params.set("status", state.orphanStatus);
+    if (state.orphanSearch) params.set("search", state.orphanSearch);
+    params.set("order", state.orphanOrder || "desc");
+    const body = $("gdrs-orphan-body");
+    let resp;
+    try {
+      resp = await fetch(`${API_ORPHANS}?${params.toString()}`, { credentials: "same-origin" });
+    } catch (exc) {
+      body.innerHTML = `<tr><td colspan="10" class="gdrs-empty">/orphans 호출 실패: ${exc}</td></tr>`;
+      return;
+    }
+    if (!resp.ok) {
+      body.innerHTML = `<tr><td colspan="10" class="gdrs-empty">/orphans HTTP ${resp.status}</td></tr>`;
+      return;
+    }
+    const data = await resp.json();
+    state.orphanTotal = Number(data.total || 0);
+    state.orphanPage = Number(data.page || state.orphanPage);
+    state.orphanPages = Number(data.pages || 0);
+    renderOrphans(data.items || []);
+    renderOrphanPagination();
+    const start = state.orphanTotal ? (state.orphanPage - 1) * state.orphanPageSize + 1 : 0;
+    const end = (state.orphanPage - 1) * state.orphanPageSize + (data.items || []).length;
+    $("gdrs-orphan-note").textContent =
+      `표시 ${start}-${end} / 전체 ${nfmt(state.orphanTotal)}건 · ${state.orphanPages}페이지`;
+  }
+
+  function renderOrphans(rows) {
+    const body = $("gdrs-orphan-body");
+    body.innerHTML = "";
+    if (!rows || !rows.length) {
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 10;
+      td.className = "gdrs-empty";
+      td.textContent = state.orphanTotal
+        ? "현재 조건에 맞는 정리 대기 항목이 없습니다."
+        : "정리 대기 항목 없음";
+      tr.appendChild(td);
+      body.appendChild(tr);
+      return;
+    }
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      // 체크박스 — pending 이고 class B/C 만 활성. A 는 자동, 종결은 되돌리지 않는다.
+      const checkTd = document.createElement("td");
+      checkTd.className = "gdrs-col-check";
+      const selectable = r.status === "pending" && (r.class === "B" || r.class === "C");
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.disabled = !selectable;
+      cb.checked = state.orphanSelected.has(r.id);
+      cb.dataset.orphanId = r.id;
+      cb.addEventListener("change", () => {
+        if (cb.checked) state.orphanSelected.add(r.id);
+        else state.orphanSelected.delete(r.id);
+        syncOrphanButtons();
+      });
+      checkTd.appendChild(cb);
+      tr.appendChild(checkTd);
+
+      tr.appendChild(cell(r.id, "gdrs-id-cell"));
+
+      const classTd = document.createElement("td");
+      const classBadge = document.createElement("span");
+      classBadge.className = `gdrs-orphan-badge gdrs-orphan-class-${r.class || "none"}`;
+      classBadge.textContent = ORPHAN_CLASS_LABEL[r.class] || r.class || "-";
+      classTd.appendChild(classBadge);
+      tr.appendChild(classTd);
+
+      const statusTd = document.createElement("td");
+      const statusBadge = document.createElement("span");
+      statusBadge.className = `gdrs-orphan-badge gdrs-orphan-status-${r.status || "unknown"}`;
+      statusBadge.textContent = ORPHAN_STATUS_LABEL[r.status] || r.status || "-";
+      statusTd.appendChild(statusBadge);
+      tr.appendChild(statusTd);
+
+      tr.appendChild(cell(r.name || "", "gdrs-name-cell", r.local_path || ""));
+
+      const pathTd = document.createElement("td");
+      pathTd.className = "gdrs-path-cell";
+      pathTd.textContent = r.local_path || "";
+      pathTd.title = r.local_path || "";
+      if (r.trash_path) {
+        const t = document.createElement("div");
+        t.className = "gdrs-prev-path";
+        t.textContent = `→ ${r.trash_path}`;
+        pathTd.appendChild(t);
+      }
+      if (r.error) pathTd.appendChild(rowErrorSpan(r.error));
+      tr.appendChild(pathTd);
+
+      tr.appendChild(cell(r.twin_path || "", "gdrs-path-cell", r.twin_path || ""));
+      tr.appendChild(cell(fmtBytes(r.size), "gdrs-size-cell", String(r.size || 0)));
+      tr.appendChild(cell(String(r.md5 || "").slice(0, 8), "gdrs-id-cell", r.md5 || ""));
+      tr.appendChild(cell(fmtDateShort(r.created_at), "gdrs-date-cell", fmtKst(r.created_at)));
+
+      body.appendChild(tr);
+    }
+  }
+
+  function renderOrphanPagination() {
+    const wrap = $("gdrs-orphan-pagination");
+    wrap.innerHTML = "";
+    if (!state.orphanPages || state.orphanPages <= 1) return;
+    const cur = state.orphanPage;
+    const pages = state.orphanPages;
+    const range = [];
+    const add = (p) => {
+      if (p >= 1 && p <= pages && !range.includes(p)) range.push(p);
+    };
+    range.push(1);
+    if (cur > 1) range.push(cur - 1);
+    for (let p = Math.max(1, cur - 2); p <= Math.min(pages, cur + 2); p++) add(p);
+    if (cur < pages) range.push(cur + 1);
+    range.push(pages);
+    const seen = new Set();
+    for (const n of range) {
+      if (seen.has(n)) continue;
+      seen.add(n);
+      const btn = document.createElement("button");
+      btn.textContent = n === 1 ? "«" : n === pages ? "»" : String(n);
+      if (n === cur) btn.classList.add("active");
+      btn.addEventListener("click", () => { if (n !== state.orphanPage) loadOrphans(n); });
+      wrap.appendChild(btn);
+    }
+  }
+
+  function syncOrphanButtons() {
+    const n = state.orphanSelected.size;
+    $("gdrs-orphan-isolate-selected").disabled = n === 0;
+    $("gdrs-orphan-keep-selected").disabled = n === 0;
+  }
+
+  async function postOrphanAction(url, body) {
+    let resp;
+    try {
+      resp = await fetch(url, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } catch (exc) {
+      alert(`호출 실패: ${exc}`);
+      return null;
+    }
+    const data = await resp.json().catch(() => ({ success: false, error: `HTTP ${resp.status}` }));
+    if (!resp.ok) alert(`실패: ${data.error || resp.status}`);
+    return data;
+  }
+
+  // 탭 전환 — 해시/쿼리 없이 메모리만 (플러그인 webview 가 location 을 안 준다).
+  function switchTab(tab) {
+    state.tab = normalizeTab(tab);
+    const isOrphans = state.tab === "orphans";
+    $("gdrs-tab-events").hidden = isOrphans;
+    $("gdrs-tab-orphans").hidden = !isOrphans;
+    $("gdrs-subtab-events").classList.toggle("is-active", !isOrphans);
+    $("gdrs-subtab-orphans").classList.toggle("is-active", isOrphans);
+    if (isOrphans) loadOrphans(1);
+  }
+
   function boot() {
     $("gdrs-search-btn").addEventListener("click", applySearch);
     $("gdrs-reset-btn").addEventListener("click", applyReset);
@@ -702,6 +905,58 @@
         $("gdrs-retry-selected").disabled = !selectAll.checked;
       });
     }
+    // ---- P13 — 하위 탭 + 정리 대기 ------------------------------------
+    $("gdrs-subtab-events").addEventListener("click", () => switchTab("events"));
+    $("gdrs-subtab-orphans").addEventListener("click", () => switchTab("orphans"));
+    $("gdrs-orphan-search-btn").addEventListener("click", () => loadOrphans(1));
+    $("gdrs-orphan-search").addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") loadOrphans(1);
+    });
+    $("gdrs-orphan-reset-btn").addEventListener("click", () => {
+      $("gdrs-orphan-filter-class").value = "";
+      $("gdrs-orphan-filter-status").value = "";
+      $("gdrs-orphan-search").value = "";
+      state.orphanSelected.clear();
+      syncOrphanButtons();
+      loadOrphans(1);
+    });
+    $("gdrs-orphan-isolate-selected").addEventListener("click", async () => {
+      const ids = Array.from(state.orphanSelected);
+      if (!ids.length) return;
+      if (!window.confirm(`선택한 ${ids.length}건을 _trash 로 옮깁니다(영구 삭제 아님). 계속할까요?`)) return;
+      const out = await postOrphanAction(API_ORPHANS_ISOLATE, { ids });
+      if (out && out.success) {
+        state.orphanSelected.clear();
+        syncOrphanButtons();
+        loadOrphans(state.orphanPage);
+      }
+    });
+    $("gdrs-orphan-keep-selected").addEventListener("click", async () => {
+      const ids = Array.from(state.orphanSelected);
+      if (!ids.length) return;
+      if (!window.confirm(`선택한 ${ids.length}건을 보존합니다. 파일은 그대로 둡니다. 계속할까요?`)) return;
+      const out = await postOrphanAction(API_ORPHANS_KEEP, { ids });
+      if (out && out.success) {
+        state.orphanSelected.clear();
+        syncOrphanButtons();
+        loadOrphans(state.orphanPage);
+      }
+    });
+    const orphanAll = $("gdrs-orphan-select-all");
+    if (orphanAll) {
+      orphanAll.addEventListener("change", () => {
+        document.querySelectorAll("#gdrs-orphan-body tr").forEach((tr) => {
+          const cb = tr.querySelector('input[type="checkbox"]');
+          if (!cb || cb.disabled) return;
+          cb.checked = orphanAll.checked;
+          const id = Number(cb.dataset.orphanId);
+          if (orphanAll.checked) state.orphanSelected.add(id);
+          else state.orphanSelected.delete(id);
+        });
+        syncOrphanButtons();
+      });
+    }
+    switchTab(DEFAULT_TAB);   // 기본 탭 events
     refresh();
     setInterval(refresh, 15000);
   }

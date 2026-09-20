@@ -27,7 +27,13 @@
     <div class="gdrs-progress-detail" id="gdrs-progress-detail"></div>
   </div>
 
-  <div class="gdrs-jobs-panel">
+  <!-- P13 §10 — 하위 탭. 변경 이벤트(기존) / 정리 대기(고아 큐). -->
+  <div class="gdrs-subtabs" role="tablist">
+    <button type="button" class="gdrs-subtab is-active" id="gdrs-subtab-events" data-tab="events">변경 이벤트</button>
+    <button type="button" class="gdrs-subtab" id="gdrs-subtab-orphans" data-tab="orphans">정리 대기</button>
+  </div>
+
+  <div class="gdrs-jobs-panel gdrs-tab-panel" id="gdrs-tab-events">
     <div class="gdrs-panel-header">
       <h3><i class="fa-solid fa-list-check"></i> 변경 이벤트</h3>
       <div class="gdrs-filter-group">
@@ -105,5 +111,63 @@
       </table>
     </div>
     <div class="gdrs-pagination" id="gdrs-pagination"></div>
+  </div>
+
+  <!-- P13 §10 — 정리 대기(고아) 큐. 영구 삭제 버튼은 없다. -->
+  <div class="gdrs-jobs-panel gdrs-tab-panel" id="gdrs-tab-orphans" hidden>
+    <div class="gdrs-panel-header">
+      <h3><i class="fa-solid fa-broom"></i> 정리 대기</h3>
+      <div class="gdrs-filter-group">
+        <select id="gdrs-orphan-filter-class" class="gdrs-select" title="등급">
+          <option value="">전체 등급</option>
+          <option value="A">A · 중복(자동)</option>
+          <option value="B">B · 이름유사</option>
+          <option value="C">C · 대체없음</option>
+        </select>
+        <select id="gdrs-orphan-filter-status" class="gdrs-select" title="상태">
+          <option value="">전체 상태</option>
+          <option value="pending">대기</option>
+          <option value="isolated">격리됨</option>
+          <option value="kept">보존</option>
+          <option value="failed">실패</option>
+          <option value="missing">파일없음</option>
+        </select>
+        <input id="gdrs-orphan-search" class="gdrs-search" placeholder="경로/이름/대조 검색 (서버측)">
+        <button id="gdrs-orphan-search-btn" class="gdrs-btn" type="button">검색</button>
+        <button id="gdrs-orphan-reset-btn" class="gdrs-btn gdrs-btn-secondary" type="button">초기화</button>
+      </div>
+      <div class="gdrs-action-group">
+        <button id="gdrs-orphan-isolate-selected" class="gdrs-btn gdrs-btn-primary" type="button" disabled>선택 격리</button>
+        <button id="gdrs-orphan-keep-selected" class="gdrs-btn" type="button" disabled>선택 보존</button>
+      </div>
+    </div>
+    <div class="gdrs-panel-note-row">
+      <span class="gdrs-panel-note" id="gdrs-orphan-note">불러오는 중…</span>
+    </div>
+    <div class="gdrs-panel-note-row">
+      <span class="gdrs-panel-note">중복(A)은 자동으로 <code>_trash</code> 로 옮깁니다. 파일은 30일 후 정리되며 휴지통 비우기 전엔 복원할 수 있습니다. 영구 삭제 버튼은 없습니다.</span>
+    </div>
+    <div class="gdrs-jobs-table-wrap">
+      <table class="gdrs-jobs-table" id="gdrs-orphan-table">
+        <thead>
+          <tr>
+            <th class="gdrs-col-check"><input type="checkbox" id="gdrs-orphan-select-all" title="현재 페이지 전체 선택"></th>
+            <th>id</th>
+            <th>등급</th>
+            <th>상태</th>
+            <th>이름</th>
+            <th>경로</th>
+            <th>대조</th>
+            <th>크기</th>
+            <th>md5</th>
+            <th>생성</th>
+          </tr>
+        </thead>
+        <tbody id="gdrs-orphan-body">
+          <tr><td colspan="10" class="gdrs-empty">데이터 없음</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="gdrs-pagination" id="gdrs-orphan-pagination"></div>
   </div>
 </div>

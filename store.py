@@ -77,6 +77,31 @@ _SCHEMA = [
         error       TEXT NOT NULL DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS idx_scan_status ON scan(status, queued_at)",
+    # P13 §3.3 — 고아(원격 삭제) 파일 격리 큐. job 과 분리한다 — cleanup_terminal 이
+    # skipped(remote_deleted) 이력을 30일 뒤 지우므로 job 컬럼에 붙이면 큐가 증발한다.
+    """CREATE TABLE IF NOT EXISTS orphan (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id        INTEGER,                          -- 출처 delete job. job 이 정리돼도 남긴다
+        file_id       TEXT NOT NULL DEFAULT '',
+        local_path    TEXT NOT NULL,                    -- 격리 전 절대경로
+        parent_dir    TEXT NOT NULL,
+        name          TEXT NOT NULL DEFAULT '',
+        size          INTEGER NOT NULL DEFAULT 0,
+        md5           TEXT NOT NULL DEFAULT '',
+        class         TEXT NOT NULL DEFAULT '',         -- ''|A|B|C  분류 전 빈 문자열
+        status        TEXT NOT NULL DEFAULT 'pending',  -- pending|isolated|kept|failed|missing
+        twin_path     TEXT NOT NULL DEFAULT '',         -- A/B 의 대조 파일
+        trash_path    TEXT NOT NULL DEFAULT '',
+        error         TEXT NOT NULL DEFAULT '',
+        created_at    TEXT,
+        classified_at TEXT,
+        resolved_at   TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_orphan_status ON orphan(status, class, id)",
+    # 같은 고아를 pending 으로 두 번 넣지 않는다. 격리/보존된 뒤 같은 경로가 다시
+    # 고아가 되면 새 pending 행을 만든다 (부분 UNIQUE 라 status='pending' 만 대상).
+    """CREATE UNIQUE INDEX IF NOT EXISTS idx_orphan_pending_path
+        ON orphan(local_path) WHERE status='pending'""",
 ]
 
 # 기존 state.db 에 나중에 생긴 컬럼을 붙인다. CREATE TABLE IF NOT EXISTS 로는
@@ -95,6 +120,8 @@ _MIGRATIONS = [
     # 리뷰 r2 F2 — dry_run→queued 승격 UPDATE 를 여기서 제거. 조회 부작용 방지.
     # 1회성 격리는 promote_dry_run_to_queued() 가 sync_state.dry_run_promoted 로 가드.
     "ALTER TABLE sync_state ADD COLUMN dry_run_promoted INTEGER NOT NULL DEFAULT 0",
+    # P13 §3.3 — 과거 remote_deleted job 백필 1회 가드. 0 이면 아직 안 돌았다.
+    "ALTER TABLE sync_state ADD COLUMN orphan_backfill_done INTEGER NOT NULL DEFAULT 0",
 ]
 
 _INIT_LOCK = threading.Lock()
@@ -979,6 +1006,201 @@ class Store:
             n = int(cur.rowcount or 0)
             self._writer.commit()
             return n
+
+    # ---- P13 — 고아(원격 삭제) 파일 격리 큐 -------------------------
+
+    # orphan_update 허용 키 (§3.4). 그 외는 KeyError.
+    _ORPHAN_UPDATE_KEYS = {
+        "class", "status", "md5", "size", "twin_path", "trash_path",
+        "error", "classified_at", "resolved_at",
+    }
+
+    def orphan_upsert_from_job(self, job: dict) -> int:
+        """§3.4 — pending INSERT OR IGNORE (unique local_path). 반환: orphan.id
+        (기존 pending 이면 그 id, no-op 이면 0).
+
+        job 키: id, file_id, local_path, size, md5, remote_path.
+        parent_dir = dirname(local_path), name = basename. local_path 가 비면 no-op, 0.
+        """
+        local_path = str(job.get("local_path") or "")
+        if not local_path:
+            return 0
+        now = _now()
+        with _WRITER_LOCK:
+            cur = self._writer.execute(
+                """INSERT OR IGNORE INTO orphan
+                    (job_id, file_id, local_path, parent_dir, name, size, md5,
+                     class, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, '', 'pending', ?)""",
+                (
+                    int(job.get("id") or 0),
+                    str(job.get("file_id") or ""),
+                    local_path,
+                    os.path.dirname(local_path),
+                    os.path.basename(local_path),
+                    int(job.get("size") or 0),
+                    str(job.get("md5") or ""),
+                    now,
+                ),
+            )
+            if cur.rowcount == 1:
+                orphan_id = int(cur.lastrowid)
+            else:
+                # unique pending local_path 충돌 — 기존 pending 행 id 를 돌려준다.
+                row = self._writer.execute(
+                    "SELECT id FROM orphan WHERE local_path=? AND status='pending'",
+                    (local_path,),
+                ).fetchone()
+                orphan_id = int(row[0]) if row else 0
+            self._writer.commit()
+            return orphan_id
+
+    def orphan_list_page(
+        self,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+        klass: str = "",
+        search: str = "",
+        order: str = "desc",
+    ) -> dict:
+        """§3.4 — 고아 목록. list_page 와 대칭 키.
+
+        반환: items, page, page_size, pages, total,
+        counts: {status: n, ...}, class_counts: {A:n,B:n,C:n,"":n}.
+        쿼리 파라미터 이름은 `class` (klass 는 파이썬 인자명).
+        """
+        try:
+            page = max(1, int(page))
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = max(10, min(int(page_size), 500))
+        except (TypeError, ValueError):
+            page_size = 50
+        order_asc = str(order or "").lower() == "asc"
+        status_n = (status or "").strip()
+        class_n = (klass or "").strip()
+        search_n = (search or "").strip()
+
+        where_parts: list[str] = ["1=1"]
+        params: list = []
+        if status_n:
+            where_parts.append("status = ?")
+            params.append(status_n)
+        if class_n:
+            where_parts.append("class = ?")
+            params.append(class_n)
+        if search_n:
+            esc = search_n.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pat = f"%{esc}%"
+            where_parts.append(
+                "(local_path LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' "
+                "OR twin_path LIKE ? ESCAPE '\\')"
+            )
+            params.extend([pat, pat, pat])
+        where_sql = " AND ".join(where_parts)
+        order_sql = "ORDER BY id ASC" if order_asc else "ORDER BY id DESC"
+
+        rows: list[dict] = []
+        total = 0
+        try:
+            with self._reader() as conn:
+                total = int(
+                    conn.execute(f"SELECT COUNT(*) FROM orphan WHERE {where_sql}", params)
+                    .fetchone()[0]
+                )
+                offset = (page - 1) * page_size
+                cur = conn.execute(
+                    f"""SELECT * FROM orphan WHERE {where_sql}
+                        {order_sql} LIMIT ? OFFSET ?""",
+                    [*params, page_size, offset],
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+        except Exception:
+            rows = []
+            total = 0
+
+        pages = (total + page_size - 1) // page_size if total else 0
+        counts: dict = {}
+        class_counts: dict = {}
+        try:
+            with self._reader() as conn:
+                counts = {
+                    r["status"]: int(r["n"])
+                    for r in conn.execute(
+                        "SELECT status, COUNT(*) AS n FROM orphan GROUP BY status"
+                    ).fetchall()
+                }
+                class_counts = {
+                    r["class"]: int(r["n"])
+                    for r in conn.execute(
+                        "SELECT class, COUNT(*) AS n FROM orphan GROUP BY class"
+                    ).fetchall()
+                }
+        except Exception:
+            pass
+
+        return {
+            "items": rows, "page": page, "page_size": page_size,
+            "pages": pages, "total": total,
+            "counts": counts, "class_counts": class_counts,
+        }
+
+    def orphan_get(self, orphan_id: int) -> dict | None:
+        """§3.4 — 단건 조회. 없으면 None."""
+        with self._reader() as conn:
+            cur = conn.execute("SELECT * FROM orphan WHERE id = ?", (int(orphan_id),))
+            row = cur.fetchone()
+        return dict(row) if row is not None else None
+
+    def orphan_pending(self) -> list[dict]:
+        """§3.4 — status='pending' 전부, id ASC. 분류기가 한 사이클에 돈다."""
+        with self._reader() as conn:
+            cur = conn.execute(
+                "SELECT * FROM orphan WHERE status='pending' ORDER BY id ASC"
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def orphan_update(self, orphan_id: int, **fields) -> None:
+        """§3.4 — 허용 키만 기록. 그 외 KeyError. 빈 fields 면 no-op."""
+        bad = set(fields) - self._ORPHAN_UPDATE_KEYS
+        if bad:
+            raise KeyError(f"orphan_update: 허용되지 않은 키 {sorted(bad)}")
+        if not fields:
+            return
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with _WRITER_LOCK:
+            self._writer.execute(
+                f"UPDATE orphan SET {cols} WHERE id = ?",
+                [*fields.values(), int(orphan_id)],
+            )
+            self._writer.commit()
+
+    def orphan_backfill_jobs(self) -> list[dict]:
+        """§7 — 과거 remote_deleted job 을 고아 후보로 읽는다 (읽기 전용)."""
+        with self._reader() as conn:
+            cur = conn.execute(
+                """SELECT id, file_id, local_path, size, md5, remote_path
+                     FROM job
+                    WHERE action='delete' AND result='remote_deleted'"""
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def orphan_backfill_is_done(self) -> bool:
+        """§3.4 — sync_state.orphan_backfill_done 플래그."""
+        row = self._writer.execute(
+            "SELECT orphan_backfill_done FROM sync_state WHERE id = 1"
+        ).fetchone()
+        return bool(row and row[0])
+
+    def orphan_mark_backfill_done(self) -> None:
+        """§3.4 — 백필 완료 플래그 set. 이미 1 이어도 멱등."""
+        with _WRITER_LOCK:
+            self._writer.execute(
+                "UPDATE sync_state SET orphan_backfill_done=1 WHERE id = 1"
+            )
+            self._writer.commit()
 
     # ----- reader helpers (별도 연결) -----
     def _reader(self) -> sqlite3.Connection:

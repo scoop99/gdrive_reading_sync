@@ -3,7 +3,7 @@
 // 구 화면이 `전체 N건 · 완료 M` 만 보여줘서 실제 84% 진행을 1% 처럼 보이게 했다.
 // 여기서 지키는 계약은 하나다: **진행률의 분자는 종결(완료+중복+실패) 전부다.**
 const assert = require("assert");
-const { computeProgress } = require("./script.js");
+const { computeProgress, normalizeTab, DEFAULT_TAB } = require("./script.js");
 
 // 1) 운영 실측값 (2026-09-10). 이게 이 수정의 이유다.
 {
@@ -65,3 +65,13 @@ const { computeProgress } = require("./script.js");
 }
 
 console.log("  OK computeProgress 7-case (종결=완료+중복+실패 · 구응답 폴백 · 빈입력 안전)");
+
+// P13 — 하위 탭 기본값. 해시/쿼리 없이 메모리만 쓰므로 기본 탭은 항상 events 고,
+// 모르는 값/누락은 events 로 접힌다 (orphans 만 예외).
+assert.strictEqual(DEFAULT_TAB, "events");
+assert.strictEqual(normalizeTab(undefined), "events");
+assert.strictEqual(normalizeTab(""), "events");
+assert.strictEqual(normalizeTab("events"), "events");
+assert.strictEqual(normalizeTab("orphans"), "orphans");
+assert.strictEqual(normalizeTab("bogus"), "events");
+console.log("  OK normalizeTab 6-case (기본 events · orphans 만 예외)");

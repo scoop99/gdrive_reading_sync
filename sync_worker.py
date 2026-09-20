@@ -532,7 +532,12 @@ def _poll_once_locked(client: DriveClient, store: Store, cfg: dict, log=print) -
                     summary["extension_skipped"] += 1
                     continue
 
-                size = (current or {}).get("size")
+                # P13 §3.2 — delete job 은 current 가 None 이라 previous 의 캐시 해시를
+                # 싣는다 (create/edit 은 오늘과 같은 current). 분류가 로컬 실물을 다시
+                # 해시하므로 캐시가 비어도 무해하다.
+                meta = current or previous or {}
+                size = int(meta.get("size") or 0)
+                md5 = str(meta.get("md5") or "")
                 modified_time = (current or {}).get("modified_time") or ""
                 store.upsert_job(
                     {
@@ -543,8 +548,8 @@ def _poll_once_locked(client: DriveClient, store: Store, cfg: dict, log=print) -
                         "remote_path": path,
                         "removed_path": event["removed_path"],
                         "local_path": _local_path(local_root, path),
-                        "size": int(size or 0),
-                        "md5": (current or {}).get("md5") or "",
+                        "size": size,
+                        "md5": md5,
                         "modified_time": modified_time,
                         "status": "queued",
                     }
@@ -1158,6 +1163,17 @@ def _prepare_copy_job(
             "job_id": job_id, "status": "failed", "result": "bad_path",
             "bytes_done": 0, "error": "local_path outside LOCAL_ROOT"}}
 
+    # P13 §0.2 — delete 판정은 D1/cold-start 보다 **앞**이다. 뒤에 두면 job 에 실린
+    # 캐시 md5 가 target(고아 파일)과 일치해 skipped/duplicate 로 삼켜져 격리 큐에
+    # 안 들어간다. safe_under 통과 직후, rename/D1 전에 둔다. 파일은 건드리지 않고
+    # (영구삭제 금지) 고아 큐에만 올린다 — 실제 이동은 분류기가 폴더를 보고 판단한다.
+    if action == "delete":
+        store.finish_job(job_id, "skipped", result="remote_deleted", bytes_done=0)
+        store.orphan_upsert_from_job(job)
+        return {"terminal": True, "out": {
+            "job_id": job_id, "status": "skipped",
+            "result": "remote_deleted", "bytes_done": 0, "error": ""}}
+
     # §6.1 — 1겹 rename
     if action == "rename" and job.get("removed_path"):
         old_rel = (job.get("removed_path") or "").replace("\\", "/").lstrip("/")
@@ -1233,14 +1249,6 @@ def _prepare_copy_job(
                 return {"terminal": True, "out": {
                     "job_id": job_id, "status": "skipped",
                     "result": "renamed_cold_start", "bytes_done": 0, "error": ""}}
-
-    if action == "delete":
-        store.finish_job(
-            job_id, "skipped", result="remote_deleted", bytes_done=0
-        )
-        return {"terminal": True, "out": {
-            "job_id": job_id, "status": "skipped",
-            "result": "remote_deleted", "bytes_done": 0, "error": ""}}
 
     return {"terminal": False, "job": job, "local_root": local_root,
             "tmp_root": tmp, "target": target}
@@ -1638,6 +1646,336 @@ def recover_on_start(
         "recovered": len(recovered),
         "tmp_cleanup": cleanup,
     }
+
+
+# ---- P13 — 고아(원격 삭제) 파일 분류·격리 --------------------------------
+# 원칙: 영구 삭제 금지. _trash 로 os.replace 이동만. 크로스 볼륨은 failed.
+# shutil.move 금지 (복사+원본 unlink 가 영구삭제다). A 등급만 자동 이동.
+
+def _names_similar(a: str, b: str) -> bool:
+    """§5.3 — B 이름 유사 판정. 둘 다 충족해야 True.
+
+    1. 확장자가 같다 (대소문자 무시. 없으면 stem 만 비교).
+    2. `#\\d+` 토큰이 하나 이상 교집합이거나, stem 유사도 >= 0.55.
+    """
+    import difflib
+    import re as _re
+    stem_a, ext_a = os.path.splitext(str(a or ""))
+    stem_b, ext_b = os.path.splitext(str(b or ""))
+    if ext_a.lower() != ext_b.lower():
+        return False
+    if not stem_a or not stem_b:
+        return False
+    toks_a = set(_re.findall(r"#\d+", stem_a))
+    toks_b = set(_re.findall(r"#\d+", stem_b))
+    if toks_a & toks_b:
+        return True
+    ratio = difflib.SequenceMatcher(None, stem_a.lower(), stem_b.lower()).ratio()
+    return ratio >= 0.55
+
+
+def classify_orphan(row: dict, *, md5_file_fn=md5_file) -> dict:
+    """§5.3 — 고아 1건을 디스크로 판정한다. store 쓰기·이동 없음 (순수에 가깝다).
+
+    반환: {class: 'A'|'B'|'C'|'missing', md5, size, twin_path, error}.
+    같은 parent_dir 만 본다 — 상위/하위 폴더로 퍼지지 않는다.
+    """
+    src = Path(str(row.get("local_path") or ""))
+    try:
+        if not src or not src.is_file():
+            return {"class": "missing", "md5": "", "size": 0,
+                    "twin_path": "", "error": "file not found"}
+        size = int(src.stat().st_size)
+        local_md5 = md5_file_fn(src)   # §5.2 — 로컬 실물 1회 해시 (항상)
+    except OSError as exc:
+        return {"class": "missing", "md5": "", "size": 0,
+                "twin_path": "", "error": str(exc)}
+
+    try:
+        entries = [e for e in src.parent.iterdir() if e.is_file() and e.name != src.name]
+    except OSError:
+        entries = []
+
+    # twins: 같은 폴더 · 다른 이름 · size 같음 · md5 같음. size 다른 이웃은 해시 안 함.
+    twins: list[Path] = []
+    for entry in entries:
+        try:
+            if entry.stat().st_size != size:
+                continue
+        except OSError:
+            continue
+        try:
+            if md5_file_fn(entry).lower() == local_md5.lower():
+                twins.append(entry)
+        except OSError:
+            continue
+    if twins:
+        return {"class": "A", "md5": local_md5, "size": size,
+                "twin_path": str(twins[0]), "error": ""}
+
+    # 이름 유사 이웃 → B, 없으면 C. (해시 없음)
+    for entry in entries:
+        if _names_similar(src.name, entry.name):
+            return {"class": "B", "md5": local_md5, "size": size,
+                    "twin_path": "", "error": ""}
+    return {"class": "C", "md5": local_md5, "size": size,
+            "twin_path": "", "error": ""}
+
+
+def _ensure_trash_root(local_root: Path) -> Path:
+    """§6.2 — {LOCAL_ROOT}/_trash/ 생성 + .bookoasisignore('*') 없으면 생성.
+
+    본체 스캐너는 디렉터리마다 ignore 를 읽고 `*` 는 그 트리를 스킵한다
+    (engine.py:266-275). 있으면 덮지 않는다. LOCAL_ROOT/.bookoasisignore 는
+    만들지 않는다 (사용자 파일을 덮을 수 있음).
+    """
+    trash = Path(local_root) / "_trash"
+    trash.mkdir(parents=True, exist_ok=True)
+    ignore = trash / ".bookoasisignore"
+    if not ignore.exists():
+        try:
+            ignore.write_text("*\n", encoding="utf-8")
+        except OSError:
+            pass
+    return trash
+
+
+def _unique_trash_dest(dest: Path, orphan_id: int) -> Path | None:
+    """§6.3 — dest 충돌 시 `.id{N}` 접미사, 그래도 있으면 `.id{N}.2` … 상한 5.
+
+    넘으면 None (호출 측이 failed/trash_name_collision).
+    """
+    if not dest.exists():
+        return dest
+    cand = dest.with_name(f"{dest.name}.id{orphan_id}")
+    if not cand.exists():
+        return cand
+    for i in range(2, 6):
+        cand = dest.with_name(f"{dest.name}.id{orphan_id}.{i}")
+        if not cand.exists():
+            return cand
+    return None
+
+
+def isolate_orphan(store, row: dict, cfg: dict, *, log=print) -> dict:
+    """§6 — `_trash/YYYY-MM-DD/<LOCAL_ROOT 상대경로>` 로 os.replace.
+
+    반환: {status, trash_path, error}  status in isolated|failed|missing.
+    영구삭제·shutil.move 금지. 크로스 볼륨(EXDEV)은 failed 로 남긴다.
+    """
+    import errno
+    local_root = _local_root_path(cfg)
+    if local_root is None:
+        return {"status": "failed", "trash_path": "", "error": "LOCAL_ROOT not configured"}
+    src = Path(str(row.get("local_path") or ""))
+    if not src or not src.is_file():
+        return {"status": "missing", "trash_path": "", "error": "file not found"}
+    if not _safe_under(local_root, src):
+        return {"status": "failed", "trash_path": "", "error": "source outside LOCAL_ROOT"}
+    try:
+        trash = _ensure_trash_root(local_root)
+    except OSError as exc:
+        return {"status": "failed", "trash_path": "", "error": f"trash root: {exc}"}
+
+    # LOCAL_ROOT 기준 상대경로를 보존한다 (평평하게 두면 이름 충돌).
+    try:
+        rel = src.relative_to(local_root)
+    except ValueError:
+        return {"status": "failed", "trash_path": "", "error": "not under LOCAL_ROOT"}
+    # §3.5 — 날짜 폴더 이름은 로컬 달력 (로그와 같은 운영자 시계). UTC 금지.
+    day = time.strftime("%Y-%m-%d", time.localtime())
+    dest = trash / day / rel
+    if not _safe_under(trash, dest):
+        return {"status": "failed", "trash_path": "", "error": "dest outside _trash"}
+    dest = _unique_trash_dest(dest, int(row.get("id") or 0))
+    if dest is None:
+        return {"status": "failed", "trash_path": "", "error": "trash_name_collision"}
+
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"status": "failed", "trash_path": "", "error": f"mkdir: {exc}"}
+    # §6.4 — 이동 직전 dest 를 로그에 남긴다 (이동 성공 후 DB 갱신 전 크래시 대비).
+    log(f"[gdrive_reading_sync] isolate orphan id={row.get('id')} -> {dest}")
+    try:
+        os.replace(src, dest)   # 같은 볼륨 원자적. 복사가 아니다.
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.EXDEV:
+            # §6.5 — 크로스 볼륨. shutil.move(copy+unlink) 를 쓰면 영구삭제다. failed.
+            return {"status": "failed", "trash_path": "",
+                    "error": f"cross_volume: {exc}"}
+        return {"status": "failed", "trash_path": "", "error": str(exc)}
+    return {"status": "isolated", "trash_path": str(dest), "error": ""}
+
+
+def _scan_touch_after_isolate(store, cfg: dict, parent_dir: str, *, log=print) -> None:
+    """§0.4 / §6.4 — 격리 성공 시 원래 부모 폴더를 스캔 대기에 넣는다.
+
+    P9 `scan_touch` **호출**만 추가한다 (스캔 로직 불변). 매칭 보관함이 없으면 생략.
+    """
+    if not parent_dir:
+        return
+    try:
+        from . import gdrive_reading_sync as _g
+        libs = _g.GdriveReadingSyncMetadataProvider._all_libraries(log=log)
+        hit = _g._pick_library(libs, parent_dir)
+    except Exception as exc:
+        log(f"[gdrive_reading_sync] orphan scan touch skip: {exc}")
+        return
+    if hit is None:
+        return
+    session, library_id, _physical = hit
+    store.scan_touch(parent_dir, session, library_id)
+    log(f"[gdrive_reading_sync] scan queued  folder="
+        f"{_g._display_folder(parent_dir, (cfg.get('LOCAL_ROOT') or '').strip())} "
+        f"(orphan isolated)")
+
+
+def classify_pending_orphans(store, cfg: dict, *, log=print) -> dict:
+    """§5.4 — pending 전부 분류. A 는 isolate_orphan 즉시. B/C 는 class 만 기록.
+
+    반환: {classified, isolated, pending_bc, missing, failed}.
+    """
+    import time as _t  # noqa: F401  (일관성: 시각은 _iso_now 사용)
+    summary = {"classified": 0, "isolated": 0, "pending_bc": 0,
+               "missing": 0, "failed": 0}
+    now = _iso_now()
+    for row in store.orphan_pending():
+        try:
+            verdict = classify_orphan(row)
+        except Exception as exc:
+            store.orphan_update(int(row["id"]), **{
+                "status": "failed", "error": str(exc), "classified_at": now})
+            summary["failed"] += 1
+            continue
+        summary["classified"] += 1
+        klass = verdict["class"]
+        if klass == "missing":
+            store.orphan_update(int(row["id"]), **{
+                "class": "", "status": "missing",
+                "error": verdict.get("error") or "file not found",
+                "classified_at": now, "resolved_at": now})
+            summary["missing"] += 1
+            continue
+        fields = {
+            "class": klass, "md5": verdict["md5"], "size": verdict["size"],
+            "twin_path": verdict["twin_path"] or "", "classified_at": now,
+            "error": "",
+        }
+        if klass == "A":
+            res = isolate_orphan(store, {**row, **fields}, cfg, log=log)
+            if res["status"] == "isolated":
+                fields.update({"status": "isolated",
+                               "trash_path": res["trash_path"],
+                               "resolved_at": now})
+                store.orphan_update(int(row["id"]), **fields)
+                summary["isolated"] += 1
+                try:
+                    _scan_touch_after_isolate(store, cfg, row.get("parent_dir"), log=log)
+                except Exception as exc:
+                    log(f"[gdrive_reading_sync] orphan scan touch failed: {exc}")
+            elif res["status"] == "missing":
+                fields.update({"status": "missing",
+                               "error": res.get("error") or "file not found",
+                               "resolved_at": now})
+                store.orphan_update(int(row["id"]), **fields)
+                summary["missing"] += 1
+            else:
+                fields.update({"status": "failed",
+                               "error": res.get("error") or "isolate failed"})
+                store.orphan_update(int(row["id"]), **fields)
+                summary["failed"] += 1
+        else:
+            store.orphan_update(int(row["id"]), **fields)
+            summary["pending_bc"] += 1
+    return summary
+
+
+def backfill_remote_deleted_orphans(store, cfg: dict, *, log=print) -> dict:
+    """§7 — 과거 `remote_deleted` job 을 **1회** 훑어 고아 큐를 채운다 (가드).
+
+    반환: {inserted, skipped_done, classified}.
+    """
+    if store.orphan_backfill_is_done():
+        return {"inserted": 0, "skipped_done": 1, "classified": None}
+    inserted = 0
+    for job in store.orphan_backfill_jobs():
+        try:
+            if store.orphan_upsert_from_job(job):
+                inserted += 1
+        except Exception as exc:
+            log(f"[gdrive_reading_sync] orphan backfill insert failed: {exc}")
+    # insert 루프가 끝나면 가드 set — 중간 크래시는 가드 0 이라 재실행 (upsert 멱등).
+    try:
+        store.orphan_mark_backfill_done()
+    except Exception as exc:
+        log(f"[gdrive_reading_sync] orphan backfill guard failed: {exc}")
+    summary = classify_pending_orphans(store, cfg, log=log)
+    return {"inserted": inserted, "skipped_done": 0, "classified": summary}
+
+
+def purge_expired_trash(local_root, retention_days: int, *, log=print) -> int:
+    """§9 — `_trash` 아래 `YYYY-MM-DD` 폴더만 정리. 반환: unlink 한 파일 수.
+
+    이 함수 밖에서는 `_trash` 를 건드리지 않는다. `shutil.rmtree` 금지 — unlink
+    대상은 `_safe_under(trash, ...)` 를 통과한 파일뿐이다. 날짜 폴더가 아닌 항목
+    (`.bookoasisignore` 포함)과 `LOCAL_ROOT` 직하 일반 파일은 손대지 않는다.
+    """
+    if local_root is None:
+        return 0
+    import datetime as _dt
+    import re as _re
+    trash = Path(local_root) / "_trash"
+    try:
+        if not trash.is_dir():
+            return 0
+    except OSError:
+        return 0
+    try:
+        rd = max(0, int(retention_days))
+    except (TypeError, ValueError):
+        rd = 30
+    cutoff = _dt.date.today() - _dt.timedelta(days=rd)   # 로컬 달력
+    removed = 0
+    for day_dir in list(trash.iterdir()):
+        try:
+            if not day_dir.is_dir():
+                continue
+        except OSError:
+            continue
+        if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_dir.name):
+            continue
+        try:
+            day = _dt.datetime.strptime(day_dir.name, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if day >= cutoff:
+            continue
+        # bottom-up — 파일 unlink 후 빈 디렉터리 rmdir.
+        for root, dirs, files in os.walk(day_dir, topdown=False):
+            root_p = Path(root)
+            for name in files:
+                fp = root_p / name
+                if not _safe_under(trash, fp):
+                    continue
+                try:
+                    fp.unlink()
+                    removed += 1
+                except OSError as exc:
+                    log(f"[gdrive_reading_sync] purge unlink failed: {fp}: {exc}")
+            for name in dirs:
+                dp = root_p / name
+                if not _safe_under(trash, dp):
+                    continue
+                try:
+                    dp.rmdir()
+                except OSError:
+                    pass
+        try:
+            day_dir.rmdir()
+        except OSError:
+            pass
+    return removed
 
 
 # ---- §4.4 — preflight 헬퍼 -------------------------------------------
