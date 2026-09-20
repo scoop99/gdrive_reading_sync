@@ -1138,9 +1138,10 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
     def _route_orphans(self):
         """P14 §3.5 — 정리 대기(고아) 목록.
 
-        쿼리: page,page_size,status,class,search,order,group.
+        쿼리: page,page_size,status,class,search,order,group,meta.
         `group=folder` 이면 폴더 묶기 + 페이지에 보이는 폴더의 `others`(고아가 아닌
         이웃 파일 이름·크기)를 listdir 로 붙인다 (Store 는 디스크를 열지 않는다).
+        P15 §2.5 — `meta` 는 Store 로 그대로 넘긴다 (패턴 판정은 Store 단일 구현).
         """
         from flask import request
         store = open_store(__file__)
@@ -1152,6 +1153,7 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
             search=request.args.get("search", default=""),
             order=request.args.get("order", default="desc"),
             group=request.args.get("group", default=""),
+            meta=request.args.get("meta", default=""),
         )
         # candidates_json → candidates (라우트가 파싱; 실패 시 []).
         for row in resp.get("items") or []:
@@ -1188,6 +1190,11 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
         `parent_dir` 가 있으면 그 폴더의 pending B/C id 를 ids 에 합친다 (중복 제거).
         파일 이동은 항상 `orphan_get(id).local_path` 기준 — parent_dir 로 임의 경로를
         replace 하지 않는다.
+
+        P15 §2.5 — `superseded`(job 이력상 덮어쓰기)는 명시 ids 로 와도 거부한다.
+        status 가 아직 pending 이어도 **live** job 조회를 한 번 더 한다 (§4 — 목록을
+        연 뒤 같은 경로가 다시 복사됐을 수 있다). 메타파일은 이름만으로 거부하지
+        않는다 — 폴더 버튼은 `parent_dir` 만 보내고 Store 가 미리 빼 준다 (§7-4).
         """
         from flask import request
         store = open_store(__file__)
@@ -1236,6 +1243,12 @@ class GdriveReadingSyncMetadataProvider(BaseMetadataProvider):
             row = store.orphan_get(oid)
             if (row is None or row.get("status") != "pending"
                     or row.get("class") not in ("B", "C")):
+                rejected.append(oid)
+                continue
+            # P15 §2.5 — job 이력상 덮어쓰기면 명시 ids 로 와도 거부한다 (isolate/keep 공통).
+            # status 가 pending 이어도 살아있는 파일일 수 있어 live 조회를 한 번 더 한다.
+            local_path = str(row.get("local_path") or "")
+            if local_path and local_path in store.orphan_superseded_paths([local_path]):
                 rejected.append(oid)
                 continue
             if action == "keep":

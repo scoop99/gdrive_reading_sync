@@ -1928,13 +1928,34 @@ def classify_pending_orphans(store, cfg: dict, *, log=print) -> dict:
 
     kept/isolated/missing/failed 행은 `orphan_pending()` 이 아예 안 읽으므로
     이 함수가 건드리지 않는다 (§P14-7/8). 반환: {classified, isolated, pending_bc,
-    missing, failed}.
+    missing, failed, superseded, superseded_lookup_failed}.
+
+    P15 §2.4 — pending 각 건을 job 이력으로 먼저 본다. 같은 `local_path` 가 삭제
+    이후 다시 내려받아졌으면(덮어쓰기) `superseded` 로 전이하고 **파일을 건드리지
+    않는다** (classify_orphan·isolate_orphan·stat 0회). A/B/C 규칙은 불변 (§0.6).
+
+    보정 라운드 1 — 덮어쓰기 조회가 실패하면 **fail-closed**: 이번 회차는 아무것도
+    분류하지 않고 즉시 반환한다. `summary["superseded_lookup_failed"] == 1` 로 알린다.
     """
     import json as _json
     summary = {"classified": 0, "isolated": 0, "pending_bc": 0,
-               "missing": 0, "failed": 0}
+               "missing": 0, "failed": 0, "superseded": 0,
+               "superseded_lookup_failed": 0}
     now = _iso_now()
     pending = store.orphan_pending()
+    # P15 §0.1 / §2.4 — 덮어쓰기 후보를 **루프 시작 전 1회 배치**로 읽는다. job 은
+    # 40만 행이라 건당 상관 서브쿼리를 넣으면 폴링이 멈춘다. 판정은 Store 단일 구현 (§3).
+    # 보정 A — fail-closed. 실패 시 빈 set() 으로 계속하면(=fail-open) 덮어쓰기 감지가
+    # 통째로 무효화되어, 같은 폴더에 twin 이 있는 살아있는 파일이 A 로 오판돼 _trash 로
+    # 간다. 아무것도 분류하지 않는 편이 안전하고 다음 사이클에 다시 시도된다.
+    try:
+        superseded_paths = store.orphan_superseded_paths(
+            [str(r.get("local_path") or "") for r in pending]
+        )
+    except Exception as exc:
+        log(f"[gdrive_reading_sync] orphan superseded lookup failed: {exc}")
+        summary["superseded_lookup_failed"] = 1
+        return summary
     # 같은 폴더의 다른 pending 고아 basename — 등급이 아니라 1순위 대조에서만 쓴다 (§0.2).
     by_parent: dict[str, set] = {}
     for r in pending:
@@ -1942,6 +1963,15 @@ def classify_pending_orphans(store, cfg: dict, *, log=print) -> dict:
             os.path.basename(str(r.get("local_path") or ""))
         )
     for row in pending:
+        lp = str(row.get("local_path") or "")
+        if lp and lp in superseded_paths:
+            # P15 §2.2 — 같은 이름으로 다시 내려받아 지금 그 경로에 살아있는 파일이다.
+            # class/md5/size/twin 을 덮지 않고 status 만 전이한다. 디스크 stat 0회.
+            store.orphan_update(int(row["id"]), **{
+                "status": "superseded", "classified_at": now})
+            summary["superseded"] += 1
+            summary["classified"] += 1
+            continue
         pdir = str(row.get("parent_dir") or "")
         own_name = os.path.basename(str(row.get("local_path") or ""))
         exclude = set(by_parent.get(pdir, set()))

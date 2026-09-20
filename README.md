@@ -48,7 +48,7 @@ Drive를 마운트해서 쓰다 보면 재생·열람이 느리고 마운트가 
 - **설치 버전 표시 (v0.3.5)** — 플러그인 이름·카테고리 탭·페이지 제목에 실제로 깔려
   있는 버전이 붙습니다. 하드코딩이 아니라 `VERSION` 파일을 읽으므로, 표시되는 숫자가
   곧 설치본입니다
-- **고아 파일 격리 (v0.4.0~0.4.1)** — 구드에서 파일 이름만 바뀌면 파일 ID 가 달라
+- **고아 파일 격리 (v0.4.0~0.4.2)** — 구드에서 파일 이름만 바뀌면 파일 ID 가 달라
   `delete`+`create` 로 들어와 로컬에 옛 파일과 새 파일이 둘 다 남고 BookOasis 가 책을
   두 권으로 등록하던 문제를 고칩니다. 삭제된 로컬 파일은 분류 후 **중복(A)이면 자동으로**
   `LOCAL_ROOT/_trash/YYYY-MM-DD/` 로 **이동**(영구 삭제 아님)하고, 이름유사(B)·대체없음(C)은
@@ -268,7 +268,7 @@ POST /api/webhook/gdrive_reading_sync/rclone-check
 ## 테스트
 
 ```bash
-python test_sync_worker.py     # 오프라인 회귀 131종. 네트워크·BookOasis 불필요
+python test_sync_worker.py     # 오프라인 회귀 144종. 네트워크·BookOasis 불필요
 node test_settings_js.js       # 설정 화면 순수 함수 회귀 16케이스
 node test_script_js.js         # 진행률/탭/크기차 순수 함수 회귀 14케이스
 ```

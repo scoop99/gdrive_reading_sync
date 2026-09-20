@@ -4213,6 +4213,360 @@ def test_T_P14_15_help_text_is_visible():
     print("  OK T-P14-15 격리/보존 설명이 보이는 본문에 있다")
 
 
+# ============================================================================
+# P15 — 덮어쓰기된 고아 제외 + 메타파일 분리 (v0.4.2)
+# ============================================================================
+# A/B/C 판정 규칙은 불변. 덮어쓰기(superseded)와 메타 목록 필터는 별개 수정이다.
+# 운영 건수(9/143/12)를 assert 에 넣지 않는다 — 재현 시점에 달라진다.
+
+def _seed_job_row(store, *, event_key, action, local_path, created_at,
+                  status="queued", result="", **kw):
+    """job 행을 시드하고 created_at/status/result 를 직접 못박는다.
+
+    P15 덮어쓰기 판정은 created_at 문자열 비교다. upsert_job 은 _now() 를 넣으므로
+    테스트에서만 UPDATE 로 고정한다 (sync_worker.py 에는 writer SQL 을 넣지 않는다).
+    """
+    _seed_job(store, event_key=event_key, action=action, local_path=local_path, **kw)
+    with store.with_writer() as conn:
+        conn.execute(
+            "UPDATE job SET created_at=?, status=?, result=? WHERE event_key=?",
+            (created_at, status, result, event_key),
+        )
+
+
+def _seed_overwrite(store, local_path, *, T="2026-09-17T02:18:37", prefix="p15",
+                    size=0, md5="", remote_path=""):
+    """같은 경로에 delete(스킵)+copied(완료) 를 같은 created_at 으로 넣는다."""
+    _seed_job_row(store, event_key=f"ek:{prefix}:del", action="delete",
+                  local_path=local_path, created_at=T, status="skipped",
+                  result="remote_deleted", remote_path=remote_path,
+                  size=size, md5=md5)
+    _seed_job_row(store, event_key=f"ek:{prefix}:cp", action="create",
+                  local_path=local_path, created_at=T, status="completed",
+                  result="copied", remote_path=remote_path, size=size, md5=md5)
+
+
+def test_T_P15_1_overwrite_after_delete_is_superseded_and_file_kept():
+    """T-P15-1 — delete 이후 같은 경로 copied(동시각) → superseded, class 유지, 파일 유지."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    local_root = Path(tempfile.mkdtemp()) / "READING"
+    payload = b"NEW_BYTES_AFTER_OVERWRITE"
+    orphan = _orphan_file(local_root, "만화/책/kavita.yaml", payload)
+    md5 = _file_bytes_md5(payload)
+    store = _store()
+    oid = _orphan_row(store, str(orphan), md5=md5, size=len(payload),
+                      klass="C", job_id=1)
+    _seed_overwrite(store, str(orphan), size=len(payload), md5=md5,
+                    remote_path="만화/책/kavita.yaml")
+    cfg = dict(CFG, LOCAL_ROOT=str(local_root))
+    summary = classify_pending_orphans(store, cfg, log=lambda *a: None)
+    row = store.orphan_get(oid)
+    assert row["status"] == "superseded", row
+    assert row["class"] == "C", row
+    assert orphan.is_file(), "살아있는 파일이 이동/삭제됐다"
+    trash = local_root / "_trash"
+    assert not trash.exists() or not any(trash.iterdir()), "superseded 인데 _trash 가 생겼다"
+    assert summary["superseded"] == 1, summary
+    assert summary["isolated"] == 0, summary
+    print("  OK T-P15-1 delete→copied(동시각) → superseded, 파일 유지")
+
+
+def test_T_P15_2_copy_before_delete_stays_pending():
+    """T-P15-2 — 예전 복사(T1) 후 삭제(T2>T1)만 있으면 pending 유지, 이동 없음."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    local_root = Path(tempfile.mkdtemp()) / "READING"
+    orphan = _orphan_file(local_root, "만화/책/solo.epub", b"OLD_COPY_ONLY")
+    store = _store()
+    oid = _orphan_row(store, str(orphan), klass="", job_id=1)
+    _seed_job_row(store, event_key="ek:p15:2cp", action="create",
+                  local_path=str(orphan), created_at="2026-09-16T00:00:00",
+                  status="completed", result="copied")
+    _seed_job_row(store, event_key="ek:p15:2del", action="delete",
+                  local_path=str(orphan), created_at="2026-09-17T00:00:00",
+                  status="skipped", result="remote_deleted")
+    cfg = dict(CFG, LOCAL_ROOT=str(local_root))
+    summary = classify_pending_orphans(store, cfg, log=lambda *a: None)
+    row = store.orphan_get(oid)
+    assert summary["superseded"] == 0, summary
+    assert row["status"] == "pending", row
+    assert row["class"] in ("B", "C"), row
+    assert orphan.is_file(), "이동됐다"
+    print("  OK T-P15-2 복사 후 삭제(cp<del) → pending 유지")
+
+
+def test_T_P15_3_id_order_is_not_evidence():
+    """T-P15-3 — copy 의 id 가 delete 보다 작아도 created_at 이 같으면 superseded."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    local_root = Path(tempfile.mkdtemp()) / "READING"
+    payload = b"LIVE_NEW_3"
+    orphan = _orphan_file(local_root, "만화/책/kavita.yaml", payload)
+    md5 = _file_bytes_md5(payload)
+    store = _store()
+    oid = _orphan_row(store, str(orphan), md5=md5, size=len(payload), klass="C", job_id=1)
+    # copy 를 먼저 insert → 더 작은 id. delete 를 나중에, 같은 created_at.
+    T = "2026-09-17T02:18:37"
+    _seed_job_row(store, event_key="ek:p15:3:cp", action="create",
+                  local_path=str(orphan), created_at=T, status="completed",
+                  result="copied", size=len(payload), md5=md5)
+    _seed_job_row(store, event_key="ek:p15:3:del", action="delete",
+                  local_path=str(orphan), created_at=T, status="skipped",
+                  result="remote_deleted", size=len(payload), md5=md5)
+    cfg = dict(CFG, LOCAL_ROOT=str(local_root))
+    classify_pending_orphans(store, cfg, log=lambda *a: None)
+    jobs = {j["event_key"]: j for j in store.read_jobs(limit=10)["jobs"]}
+    assert jobs["ek:p15:3:cp"]["id"] < jobs["ek:p15:3:del"]["id"], jobs
+    row = store.orphan_get(oid)
+    assert row["status"] == "superseded", row
+    print("  OK T-P15-3 id 순서 무관 (created_at 동일) → superseded")
+
+
+def test_T_P15_4_equal_timestamps_use_ge_not_gt():
+    """T-P15-4 — cp_at == del_at 이면 구제한다 (`>` 로 바꾸면 놓친다)."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    local_root = Path(tempfile.mkdtemp()) / "READING"
+    payload = b"LIVE_NEW_4"
+    orphan = _orphan_file(local_root, "만화/책/kavita.yaml", payload)
+    md5 = _file_bytes_md5(payload)
+    store = _store()
+    oid = _orphan_row(store, str(orphan), md5=md5, size=len(payload), klass="C", job_id=1)
+    T = "2026-09-17T02:18:37"
+    _seed_overwrite(store, str(orphan), T=T, size=len(payload), md5=md5, prefix="p15:4")
+    cfg = dict(CFG, LOCAL_ROOT=str(local_root))
+    classify_pending_orphans(store, cfg, log=lambda *a: None)
+    jobs = {j["event_key"]: j for j in store.read_jobs(limit=10)["jobs"]}
+    assert jobs["ek:p15:4:cp"]["created_at"] == jobs["ek:p15:4:del"]["created_at"], jobs
+    assert jobs["ek:p15:4:del"]["created_at"] == T, jobs
+    assert store.orphan_get(oid)["status"] == "superseded", store.orphan_get(oid)
+    assert orphan.is_file()
+    print("  OK T-P15-4 cp_at == del_at → superseded (>= 이지 > 가 아님)")
+
+
+def test_T_P15_5_list_page_meta_filter():
+    """T-P15-5 — 기본 목록은 메타 제외. only 는 메타만. is_meta 키가 실린다."""
+    store = _store()
+    _orphan_row(store, "T:/LIB/책/book.epub", klass="B", job_id=1)
+    _orphan_row(store, "T:/LIB/책/kavita.yaml", klass="C", job_id=2)
+    out = store.orphan_list_page(status="pending")
+    names = {r["name"] for r in out["items"]}
+    assert "kavita.yaml" not in names, out
+    assert out["total"] == 1, out
+    assert out["items"][0]["name"] == "book.epub", out
+    assert out["items"][0]["is_meta"] is False, out
+    out_only = store.orphan_list_page(status="pending", meta="only")
+    assert out_only["total"] == 1, out_only
+    assert out_only["items"][0]["name"] == "kavita.yaml", out_only
+    assert out_only["items"][0]["is_meta"] is True, out_only
+    out_inc = store.orphan_list_page(status="pending", meta="include")
+    assert out_inc["total"] == 2, out_inc
+    out_bad = store.orphan_list_page(status="pending", meta="bogus")   # 그 외 → exclude
+    assert out_bad["total"] == 1, out_bad
+    print("  OK T-P15-5 기본 메타 제외 / only 메타만 / is_meta")
+
+
+def test_T_P15_6_folder_bulk_skips_superseded_and_meta():
+    """T-P15-6 — 합격 4항. 폴더 일괄이 메타·덮어쓰기 파일을 절대 안 건드린다."""
+    import unittest.mock as _mock
+    import plugins.metadata.gdrive_reading_sync.gdrive_reading_sync as _g
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    root = Path(tempfile.mkdtemp()) / "READING"
+    pdir = str((root / "만화" / "책"))
+    epub = _orphan_file(root, "만화/책/old#1.epub", b"EPUB_OLD")
+    yaml = _orphan_file(root, "만화/책/kavita.yaml", b"KAVITA")
+    cover = _orphan_file(root, "만화/책/cover.jpg", b"COVERNEW")
+    store = _store()
+    epub_id = _orphan_row(store, str(epub), klass="B", job_id=1)
+    _orphan_row(store, str(yaml), klass="C", job_id=2)
+    cover_id = _orphan_row(store, str(cover), klass="C", job_id=3)
+    _seed_overwrite(store, str(cover), prefix="p15:6", size=len(b"COVERNEW"))
+    cfg = dict(CFG, LOCAL_ROOT=str(root))
+    classify_pending_orphans(store, cfg, log=lambda *a: None)
+
+    assert store.orphan_ids_pending_in_parent(pdir) == [epub_id], \
+        store.orphan_ids_pending_in_parent(pdir)
+
+    class _Req:
+        def get_json(self, force=False, silent=False):
+            return {"parent_dir": pdir}
+
+    provider = GdriveReadingSyncMetadataProvider()
+    provider._cfg = lambda db_type="general": {"LOCAL_ROOT": str(root)}
+    flask_stub = sys.modules["flask"]
+    captured = {}
+    with _mock.patch.object(flask_stub, "request", _Req()), \
+         _mock.patch.object(_g, "open_store", return_value=store), \
+         _mock.patch.object(_g, "jsonify", side_effect=lambda body: captured.update(body)):
+        provider._route_orphans_isolate()
+    m = {str(r["local_path"]): r for r in store.orphan_list_page(meta="include")["items"]}
+    assert m[str(epub)]["status"] == "isolated", m[str(epub)]
+    assert not epub.exists(), "진짜 고아 epub 이 이동되지 않았다"
+    assert epub_id in (captured.get("results") and [x["id"] for x in captured["results"]]), captured
+    assert m[str(yaml)]["status"] == "pending", m[str(yaml)]
+    assert yaml.is_file(), "메타 kavita.yaml 이 격리됐다"
+    assert m[str(cover)]["status"] in ("superseded", "pending"), m[str(cover)]
+    assert cover.is_file(), "덮어쓴 cover.jpg 가 이동됐다"
+    assert cover_id not in [x["id"] for x in (captured.get("results") or [])], captured
+    print("  OK T-P15-6 폴더 일괄 — epub 만 격리, yaml·cover 유지")
+
+
+def test_T_P15_7_explicit_id_isolate_of_superseded_is_rejected():
+    """T-P15-7 — 명시 ids 로 superseded 를 isolate 하면 reject, 파일 유지."""
+    import unittest.mock as _mock
+    import plugins.metadata.gdrive_reading_sync.gdrive_reading_sync as _g
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    root = Path(tempfile.mkdtemp()) / "READING"
+    payload = b"LIVE_NEW_7"
+    orphan = _orphan_file(root, "만화/책/kavita.yaml", payload)
+    md5 = _file_bytes_md5(payload)
+    store = _store()
+    oid = _orphan_row(store, str(orphan), md5=md5, size=len(payload), klass="C", job_id=1)
+    _seed_overwrite(store, str(orphan), size=len(payload), md5=md5, prefix="p15:7")
+    cfg = dict(CFG, LOCAL_ROOT=str(root))
+    classify_pending_orphans(store, cfg, log=lambda *a: None)
+    assert store.orphan_get(oid)["status"] == "superseded", store.orphan_get(oid)
+
+    class _Req:
+        def get_json(self, force=False, silent=False):
+            return {"ids": [oid]}
+
+    provider = GdriveReadingSyncMetadataProvider()
+    provider._cfg = lambda db_type="general": {"LOCAL_ROOT": str(root)}
+    flask_stub = sys.modules["flask"]
+    captured = {}
+    with _mock.patch.object(flask_stub, "request", _Req()), \
+         _mock.patch.object(_g, "open_store", return_value=store), \
+         _mock.patch.object(_g, "jsonify", side_effect=lambda body: captured.update(body)):
+        provider._route_orphans_isolate()
+    assert oid in captured.get("rejected_ids", []), captured
+    assert store.orphan_get(oid)["status"] == "superseded", store.orphan_get(oid)
+    assert orphan.is_file(), "reject 인데 파일이 이동됐다"
+    print("  OK T-P15-7 명시 id superseded isolate → reject, 파일 유지")
+
+
+def test_T_P15_8_explicit_id_isolate_of_real_meta_orphan_is_allowed():
+    """T-P15-8 — 덮어쓰기 이력이 없는 진짜 고아 yaml 은 명시 ids 로 격리 허용."""
+    import unittest.mock as _mock
+    import plugins.metadata.gdrive_reading_sync.gdrive_reading_sync as _g
+    root = Path(tempfile.mkdtemp()) / "READING"
+    orphan = _orphan_file(root, "만화/책/kavita.yaml", b"REAL_ORPHAN")
+    store = _store()
+    oid = _orphan_row(store, str(orphan), klass="C", job_id=1)
+    _seed_job_row(store, event_key="ek:p15:8del", action="delete",
+                  local_path=str(orphan), created_at="2026-09-17T00:00:00",
+                  status="skipped", result="remote_deleted")
+
+    class _Req:
+        def get_json(self, force=False, silent=False):
+            return {"ids": [oid]}
+
+    provider = GdriveReadingSyncMetadataProvider()
+    provider._cfg = lambda db_type="general": {"LOCAL_ROOT": str(root)}
+    flask_stub = sys.modules["flask"]
+    captured = {}
+    with _mock.patch.object(flask_stub, "request", _Req()), \
+         _mock.patch.object(_g, "open_store", return_value=store), \
+         _mock.patch.object(_g, "jsonify", side_effect=lambda body: captured.update(body)):
+        provider._route_orphans_isolate()
+    assert captured.get("done") == 1, captured
+    assert store.orphan_get(oid)["status"] == "isolated", store.orphan_get(oid)
+    assert not orphan.exists(), "진짜 고아 yaml 이 이동되지 않았다"
+    print("  OK T-P15-8 진짜 고아 yaml 명시 id isolate → 허용")
+
+
+def test_T_P15_9_is_orphan_meta_name():
+    """T-P15-9 — basename 규칙: 확장자 4종(접미사) + cover/folder(점 하나+확장자 하나).
+
+    보정 라운드 1 — `cover.` 접두사만 보면 `cover.jpg.epub` 이 숨어버린다. 그래서
+    접두사 규칙은 확장자가 하나뿐일 때만 참이고, 접미사 규칙(`a.b.json`)은 그대로다.
+    """
+    from plugins.metadata.gdrive_reading_sync.store import is_orphan_meta_name
+    for name in ("kavita.yaml", "A.YML", "x.xml", "a.json", "a.b.json",
+                 "cover.jpg", "folder.png", "Cover.PNG",
+                 r"C:\lib\kavita.yaml", "/mnt/lib/folder.opf"):
+        assert is_orphan_meta_name(name) is True, name
+    for name in ("book.epub", "yaml.txt", "mycover.jpg", "folder-note.txt",
+                 "cover", "", "covers.jpg",
+                 "cover.jpg.epub", "folder.a.b"):
+        assert is_orphan_meta_name(name) is False, name
+    print("  OK T-P15-9 is_orphan_meta_name 참/거짓 경계")
+
+
+def test_T_P15_10_startup_reclassify_is_idempotent_without_new_flag():
+    """T-P15-10 — 재분류 두 번: 첫 superseded 1, 둘째 0, 행 1개 유지. 새 플래그 없음."""
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    local_root = Path(tempfile.mkdtemp()) / "READING"
+    payload = b"LIVE_NEW_10"
+    orphan = _orphan_file(local_root, "만화/책/kavita.yaml", payload)
+    md5 = _file_bytes_md5(payload)
+    store = _store()
+    oid = _orphan_row(store, str(orphan), md5=md5, size=len(payload), klass="C", job_id=1)
+    _seed_overwrite(store, str(orphan), size=len(payload), md5=md5, prefix="p15:10")
+    cfg = dict(CFG, LOCAL_ROOT=str(local_root))
+    first = classify_pending_orphans(store, cfg, log=lambda *a: None)
+    second = classify_pending_orphans(store, cfg, log=lambda *a: None)
+    assert first["superseded"] == 1, first
+    assert second["superseded"] == 0, second
+    assert store.orphan_get(oid)["status"] == "superseded", store.orphan_get(oid)
+    assert len(store.orphan_list_page(meta="include")["items"]) == 1
+    with store._reader() as conn:
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(sync_state)").fetchall()]
+    assert not any(c.startswith("orphan_superseded") for c in cols), cols
+    print("  OK T-P15-10 재분류 멱등, 새 플래그 없음")
+
+
+def test_T_P15_11_overwrite_logic_keeps_A_twin_isolation():
+    """T-P15-11 — T-P13-3 회귀: 다른 이름 twin 은 여전히 A 로 격리된다."""
+    test_T_P13_3_same_cycle_delete_create_classifies_A_and_isolates()
+    print("  OK T-P15-11 T-P13-3 회귀 — 다른 경로 twin 은 A 유지")
+
+
+def test_T_P15_12_parent_ids_exclude_meta_without_breaking_p14_10():
+    """T-P15-12 — T-P14-10 시드 + 같은 폴더 yaml pending C. yaml 은 결과에 없다."""
+    store = _store()
+    p = "T:/LIB/책/series"
+    b_id = _orphan_row(store, f"{p}/b#1.zip", klass="B", job_id=1)
+    c_id = _orphan_row(store, f"{p}/c#2.zip", klass="C", job_id=2)
+    _orphan_row(store, f"{p}/a#3.zip", klass="A", job_id=3)
+    _orphan_row(store, f"{p}/k#4.zip", klass="B", status="kept", job_id=4)
+    y_id = _orphan_row(store, f"{p}/kavita.yaml", klass="C", job_id=5)
+    got = store.orphan_ids_pending_in_parent(p)
+    assert got == [b_id, c_id], (got, b_id, c_id)
+    assert y_id not in got, got
+    # 원본 T-P14-10 도 그대로 통과해야 한다 (기존 함수·기대값 변경 금지)
+    test_T_P14_10_ids_pending_in_parent()
+    print("  OK T-P15-12 parent id 축소 — 메타 제외, T-P14-10 유지")
+
+
+def test_T_P15_13_superseded_lookup_failure_aborts_batch():
+    """T-P15-13 — 보정 A. 조회 예외는 fail-closed: 아무것도 분류하지 않고 파일을 지킨다.
+
+    fail-open(set() 으로 계속)이면 덮어쓰기 감지가 무효화되어, 같은 폴더에 twin(md5 동일)이
+    있는 살아있는 파일이 A 로 오판돼 _trash 로 간다. 그 경로를 회귀로 못박는다.
+    """
+    import unittest.mock as _mock
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    local_root = Path(tempfile.mkdtemp()) / "READING"
+    payload = b"LIVE_OVERWRITTEN"
+    orphan = _orphan_file(local_root, "만화/책/book.epub", payload)
+    _orphan_file(local_root, "만화/책/book (리디).epub", payload)   # 같은 md5 twin → 실패 시 A
+    md5 = _file_bytes_md5(payload)
+    store = _store()
+    oid = _orphan_row(store, str(orphan), md5=md5, size=len(payload), klass="C", job_id=1)
+    _seed_overwrite(store, str(orphan), size=len(payload), md5=md5, prefix="p15:13")
+    cfg = dict(CFG, LOCAL_ROOT=str(local_root))
+    with _mock.patch.object(store, "orphan_superseded_paths",
+                            _mock.Mock(side_effect=RuntimeError("boom"))):
+        summary = classify_pending_orphans(store, cfg, log=lambda *a: None)
+    assert summary.get("superseded_lookup_failed") == 1, summary
+    assert summary["isolated"] == 0, summary
+    assert summary["classified"] == 0, summary
+    row = store.orphan_get(oid)
+    assert row["status"] == "pending", row
+    assert orphan.is_file(), "조회 실패인데 살아있는 파일이 이동/삭제됐다"
+    trash = local_root / "_trash"
+    assert not trash.exists() or not any(trash.iterdir()), "fail-open 이면 여기서 깨진다"
+    print("  OK T-P15-13 superseded 조회 실패 → fail-closed, 파일 유지")
+
+
 if __name__ == "__main__":
     tests = [
         # 기존 6종 (1라운드 회귀)
@@ -4367,6 +4721,21 @@ if __name__ == "__main__":
         test_T_P14_13_candidates_have_no_md5_key,
         test_T_P14_14_orphan_thead_has_no_id_md5_created,
         test_T_P14_15_help_text_is_visible,
+        # P15 — 덮어쓰기된 고아 제외 + 메타파일 분리 (v0.4.2) 신규 12종
+        test_T_P15_1_overwrite_after_delete_is_superseded_and_file_kept,
+        test_T_P15_2_copy_before_delete_stays_pending,
+        test_T_P15_3_id_order_is_not_evidence,
+        test_T_P15_4_equal_timestamps_use_ge_not_gt,
+        test_T_P15_5_list_page_meta_filter,
+        test_T_P15_6_folder_bulk_skips_superseded_and_meta,
+        test_T_P15_7_explicit_id_isolate_of_superseded_is_rejected,
+        test_T_P15_8_explicit_id_isolate_of_real_meta_orphan_is_allowed,
+        test_T_P15_9_is_orphan_meta_name,
+        test_T_P15_10_startup_reclassify_is_idempotent_without_new_flag,
+        test_T_P15_11_overwrite_logic_keeps_A_twin_isolation,
+        test_T_P15_12_parent_ids_exclude_meta_without_breaking_p14_10,
+        # 보정 라운드 1 — superseded 조회 실패 fail-closed (신규 1종)
+        test_T_P15_13_superseded_lookup_failure_aborts_batch,
     ]
     for fn in tests:
         fn()

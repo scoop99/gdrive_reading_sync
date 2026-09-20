@@ -86,6 +86,7 @@
     orphanPageSize: 50,   // P14 §3.6 — 폴더 페이지 크기 (26 폴더가 한 화면)
     orphanClass: "",
     orphanStatus: "",
+    orphanMeta: "exclude",   // P15 — 메타파일 필터 (exclude|include|only)
     orphanSearch: "",
     orphanOrder: "desc",
     orphanPages: 0,
@@ -141,7 +142,7 @@
   const ORPHAN_CLASS_LABEL = { A: "중복(자동)", B: "이름유사", C: "대체없음" };
   const ORPHAN_STATUS_LABEL = {
     pending: "대기", isolated: "격리됨", kept: "보존",
-    failed: "실패", missing: "파일없음",
+    failed: "실패", missing: "파일없음", superseded: "덮어씀",
   };
 
   function fmtBytes(n) {
@@ -718,7 +719,9 @@
     // 체크 — pending 이고 class B/C 만.
     const checkTd = document.createElement("td");
     checkTd.className = "gdrs-col-check";
-    const selectable = r.status === "pending" && (r.class === "B" || r.class === "C");
+    // P15 §2.6 — 메타파일은 서버가 목록에서 빼 주지만 클라이언트도 선택을 막는다.
+    const selectable = r.status === "pending"
+      && (r.class === "B" || r.class === "C") && !r.is_meta;
     const cb = document.createElement("input");
     cb.type = "checkbox";
     cb.disabled = !selectable;
@@ -931,6 +934,7 @@
     if (page) state.orphanPage = page;
     state.orphanClass = $("gdrs-orphan-filter-class").value || "";
     state.orphanStatus = $("gdrs-orphan-filter-status").value || "";
+    state.orphanMeta = $("gdrs-orphan-filter-meta").value || "exclude";
     state.orphanSearch = $("gdrs-orphan-search").value.trim();
     const params = new URLSearchParams();
     params.set("page", String(state.orphanPage));
@@ -938,6 +942,7 @@
     params.set("group", "folder");   // P14 §0.5 — 폴더 단위 페이징
     if (state.orphanClass) params.set("class", state.orphanClass);
     if (state.orphanStatus) params.set("status", state.orphanStatus);
+    params.set("meta", state.orphanMeta || "exclude");   // P15 — 메타파일 필터
     if (state.orphanSearch) params.set("search", state.orphanSearch);
     params.set("order", state.orphanOrder || "desc");
     const body = $("gdrs-orphan-body");
@@ -1102,6 +1107,7 @@
     $("gdrs-orphan-reset-btn").addEventListener("click", () => {
       $("gdrs-orphan-filter-class").value = "";
       $("gdrs-orphan-filter-status").value = "";
+      $("gdrs-orphan-filter-meta").value = "exclude";
       $("gdrs-orphan-search").value = "";
       state.orphanSelected.clear();
       syncOrphanButtons();

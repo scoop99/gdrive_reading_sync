@@ -131,6 +131,12 @@
           <option value="kept">보존</option>
           <option value="failed">실패</option>
           <option value="missing">파일없음</option>
+          <option value="superseded">덮어씀</option>
+        </select>
+        <select id="gdrs-orphan-filter-meta" class="gdrs-select" title="메타파일">
+          <option value="exclude" selected>메타 숨김</option>
+          <option value="include">메타 포함</option>
+          <option value="only">메타만</option>
         </select>
         <input id="gdrs-orphan-search" class="gdrs-search" placeholder="경로/이름/대조 검색 (서버측)">
         <button id="gdrs-orphan-search-btn" class="gdrs-btn" type="button">검색</button>
@@ -148,6 +154,7 @@
       <div class="gdrs-orphan-help-line"><strong>격리:</strong> 삭제하지 않습니다. 파일을 <code>_trash/오늘날짜/원래경로</code> 로 옮기고, 30일 안에 그 폴더에서 되돌릴 수 있습니다. 30일이 지나면 자동 정리됩니다.</div>
       <div class="gdrs-orphan-help-line"><strong>보존:</strong> 파일은 지금 자리에 둡니다. 이 목록에서 빼 다시 묻지 않습니다.</div>
       <div class="gdrs-orphan-help-line">중복(A)은 이미 자동으로 옮겼습니다. 영구 삭제 버튼은 없습니다.</div>
+      <div class="gdrs-orphan-help-line"><strong>덮어씀:</strong> 같은 이름으로 다시 내려받아 지금 그 경로에 살아 있는 파일입니다. 격리하지 않습니다. yaml·json 등 메타파일은 기본 목록에서 숨깁니다.</div>
     </div>
     <div class="gdrs-jobs-table-wrap">
       <table class="gdrs-jobs-table" id="gdrs-orphan-table">

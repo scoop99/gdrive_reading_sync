@@ -433,6 +433,7 @@
 .gdrs-orphan-status-kept { background: #64748b; }
 .gdrs-orphan-status-failed { background: #dc2626; }
 .gdrs-orphan-status-missing { background: #7c3aed; }
+.gdrs-orphan-status-superseded { background: #0d9488; }   /* P15 — 덮어씀 → 격리 대상 아님 */
 .gdrs-name-cell {
     max-width: 280px;
     overflow: hidden;

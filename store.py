@@ -61,6 +61,10 @@ _SCHEMA = [
         finished_at TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_job_status ON job(status, id)",
+    # P15 §0.1 — 덮어쓰기(superseded) 판정이 local_path 로 job 을 조회한다.
+    # job 은 40만 행 규모이고 이 인덱스가 없으면 그 조회가 분 단위가 된다.
+    # 상관 서브쿼리 대신 IN 배치 1회 조회를 쓰기 위한 전제 인덱스 (§10-1).
+    "CREATE INDEX IF NOT EXISTS idx_job_local_path ON job(local_path)",
     # P9 — 복사 완료 후 책 폴더 단위 자동 스캔. 1행 = 1책 폴더 = 1스캔 단위.
     # queue 를 거치지 않으므로 여기서 debounce(queued_at 기준)와 claim 상태를 관리한다.
     """CREATE TABLE IF NOT EXISTS scan (
@@ -89,7 +93,7 @@ _SCHEMA = [
         size          INTEGER NOT NULL DEFAULT 0,
         md5           TEXT NOT NULL DEFAULT '',
         class         TEXT NOT NULL DEFAULT '',         -- ''|A|B|C  분류 전 빈 문자열
-        status        TEXT NOT NULL DEFAULT 'pending',  -- pending|isolated|kept|failed|missing
+        status        TEXT NOT NULL DEFAULT 'pending',  -- pending|isolated|kept|failed|missing|superseded
         twin_path     TEXT NOT NULL DEFAULT '',         -- A/B 의 대조 파일
         trash_path    TEXT NOT NULL DEFAULT '',
         error         TEXT NOT NULL DEFAULT '',
@@ -140,6 +144,42 @@ def _db_path(plugin_root: Path) -> Path:
 
 def _ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+# P15 §2.3 / §7 — 책이 아니라 메타데이터인 파일 이름. 목록 기본 필터(meta=exclude)와
+# 폴더 일괄이 같은 규칙을 쓰도록 단일 구현을 둔다 (sync_worker 도 이걸 import 한다).
+_ORPHAN_META_EXTS = (".yaml", ".yml", ".xml", ".json")
+# SQL 쪽 대응. orphan.name 컬럼은 basename 이라 그대로 쓴다. SQLite LIKE 는 ASCII
+# 대소문자를 구분하지 않으므로 별도 LOWER() 가 필요 없다.
+# `cover.`/`folder.` 는 **점 하나 + 확장자 하나**일 때만이다 (아래 is_orphan_meta_name
+# 과 같은 규칙 — `cover.jpg.epub` 를 메타로 오분류하지 않는다). 확장자 접미사 판정은
+# 접두사와 무관한 접미사 규칙이라 그대로 둔다 (`a.b.json` 은 계속 참).
+_ORPHAN_META_SQL = (
+    "(name LIKE '%.yaml' OR name LIKE '%.yml' OR name LIKE '%.xml' "
+    "OR name LIKE '%.json' OR "
+    "((name LIKE 'cover._%' OR name LIKE 'folder._%') "
+    "AND length(name) - length(replace(name, '.', '')) = 1))"
+)
+
+
+def is_orphan_meta_name(name: str) -> bool:
+    """§2.3 — basename 만 보고 메타파일 이름인지 판정한다. 대소문자 무시.
+
+    참: `*.yaml` `*.yml` `*.xml` `*.json` (접미사 규칙 — `a.b.json` 도 참),
+    그리고 basename 이 `cover` / `folder` 이고 **점 하나 + 확장자 하나**로 끝나는 것.
+    경로 전체 문자열은 보지 않는다 (`mycover.jpg`, `folder-note.txt`, `cover` 는 거짓).
+
+    보정 라운드 1 (리뷰 피드백 2) — `cover.`/`folder.` 접두사만 보면 `cover.jpg.epub`
+    같은 실제 전자책이 메타로 숨어 목록에서 빠진다. 그래서 접두사 규칙은 확장자가
+    하나뿐일 때만 참이다 (`cover.jpg` 참, `cover.jpg.epub` / `folder.a.b` 거짓).
+    """
+    base = os.path.basename(str(name or "")).lower()
+    if not base:
+        return False
+    if base.endswith(_ORPHAN_META_EXTS):
+        return True
+    stem, ext = os.path.splitext(base)
+    return len(ext) > 1 and stem in ("cover", "folder")
 
 
 def open_store(plugin_file: str | os.PathLike[str]) -> "Store":
@@ -1071,6 +1111,7 @@ class Store:
         search: str = "",
         order: str = "desc",
         group: str = "",
+        meta: str = "exclude",
     ) -> dict:
         """§3.4 — 고아 목록. list_page 와 대칭 키.
 
@@ -1080,6 +1121,10 @@ class Store:
         group=folder 추가 키: folders: [Folder], folder_total.
         pages 는 folder_total 기준, total 은 (필터 후) 행 수를 유지해 배지와 안 싸운다.
         쿼리 파라미터 이름은 `class` (klass 는 파이썬 인자명).
+
+        P15 §2.3 — `meta` 는 메타파일 노출 필터다. `exclude`(기본) 는 WHERE 에서 제외,
+        `include` 는 전체, `only` 는 메타만. 그 외 값은 `exclude` 로 정규화한다.
+        각 item 행에는 `is_meta`(bool) 를 Store 가 채운다.
         """
         try:
             page = max(1, int(page))
@@ -1110,6 +1155,14 @@ class Store:
                 "OR twin_path LIKE ? ESCAPE '\\')"
             )
             params.extend([pat, pat, pat])
+        # P15 §2.3 — 메타필터. 기본 exclude 라 구 클라이언트가 meta 를 안 보내도 빠진다.
+        meta_n = str(meta or "").strip().lower()
+        if meta_n not in ("exclude", "include", "only"):
+            meta_n = "exclude"
+        if meta_n == "exclude":
+            where_parts.append(f"NOT {_ORPHAN_META_SQL}")
+        elif meta_n == "only":
+            where_parts.append(_ORPHAN_META_SQL)
         where_sql = " AND ".join(where_parts)
 
         if str(group or "") == "folder":
@@ -1135,6 +1188,10 @@ class Store:
             rows = []
             total = 0
 
+        # P15 §2.3 — 메타 여부는 라우트가 아니라 Store 가 채운다 (웹이 패턴을 재구현하지 않게).
+        for row in rows:
+            row["is_meta"] = is_orphan_meta_name(row.get("name") or "")
+
         pages = (total + page_size - 1) // page_size if total else 0
         counts, class_counts = self._orphan_counts()
         return {
@@ -1147,7 +1204,7 @@ class Store:
     def _orphan_folder_counts(items: list[dict]) -> dict:
         """§3.4 — 그 폴더의 **현재 WHERE 에 걸린** 행 기준 counts. (필터=B 면 C 는 0)"""
         out = {"pending": 0, "B": 0, "C": 0, "isolated": 0,
-               "kept": 0, "missing": 0, "failed": 0}
+               "kept": 0, "missing": 0, "failed": 0, "superseded": 0}
         for r in items:
             st = str(r.get("status") or "")
             cl = str(r.get("class") or "")
@@ -1193,6 +1250,13 @@ class Store:
                 rows = [dict(r) for r in cur.fetchall()]
         except Exception:
             rows = []
+        for row in rows:
+            row["is_meta"] = is_orphan_meta_name(row.get("name") or "")
+        # P15 §2.3 — 폴더 일괄 버튼이 보내는 pending_ids 를 여기서 만든다. 덮어쓰기
+        # 판정은 루프에 넣지 않고 **1회 배치**로 읽는다 (§0.1 — 상관 서브쿼리 금지).
+        superseded = self.orphan_superseded_paths(
+            [str(r.get("local_path") or "") for r in rows]
+        )
         grouped: dict[str, list[dict]] = {}
         for r in rows:
             grouped.setdefault(str(r.get("parent_dir") or ""), []).append(r)
@@ -1211,9 +1275,13 @@ class Store:
             items_sorted = sorted(
                 items, key=lambda r: (str(r.get("name") or ""), int(r["id"]))
             )
+            # P15 §2.3 — 폴더 일괄 대상에서 메타파일과 덮어쓰기(superseded) 를 뺀다.
+            # 상태가 아직 pending 이어도 job 이력상 덮어쓰기면 뺀다 (살아있는 파일).
             pending_ids = [
                 int(r["id"]) for r in items_sorted
-                if (r.get("status") == "pending" and r.get("class") in ("B", "C"))
+                if (r.get("status") == "pending" and r.get("class") in ("B", "C")
+                    and not r.get("is_meta")
+                    and str(r.get("local_path") or "") not in superseded)
             ]
             folders.append({
                 "parent_dir": pdir,
@@ -1247,21 +1315,81 @@ class Store:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    def orphan_superseded_paths(self, local_paths: list[str]) -> set[str]:
+        """P15 §2.1 / §2.3 — 덮어쓰기된(격리 금지) local_path 집합. 읽기 전용.
+
+        입력의 각 경로에 대해 job 이력만 본다 (§0.2/§0.3/§0.5):
+          del_at = MAX(created_at WHERE action='delete')
+          cp_at  = MAX(created_at WHERE status='completed'
+                        AND result IN ('copied','copied_size_only'))
+          superseded ⇔ del_at 과 cp_at 이 모두 있고 cp_at >= del_at
+        크기·md5·orphan.created_at·job.id 대소·finished_at 은 쓰지 않는다.
+        빈 입력 → set(). `idx_job_local_path` 전제 (상관 서브쿼리 금지 — IN 배치 1회).
+        """
+        uniq = sorted({str(p) for p in (local_paths or []) if p})
+        if not uniq:
+            return set()
+        del_at: dict[str, str] = {}
+        cp_at: dict[str, str] = {}
+        with self._reader() as conn:
+            step = 500   # SQLite 변수 상한 회피 (scan_map 과 같은 배치 크기)
+            for i in range(0, len(uniq), step):
+                chunk = uniq[i:i + step]
+                placeholders = ",".join("?" for _ in chunk)
+                cur = conn.execute(
+                    f"""SELECT local_path, action, status, result, created_at
+                          FROM job
+                         WHERE local_path IN ({placeholders})
+                           AND (action='delete'
+                                OR (status='completed'
+                                    AND result IN ('copied','copied_size_only')))""",
+                    chunk,
+                )
+                for j in cur.fetchall():
+                    lp = str(j["local_path"] or "")
+                    ts = j["created_at"] or ""
+                    if j["action"] == "delete":
+                        if lp not in del_at or ts > del_at[lp]:
+                            del_at[lp] = ts
+                    if j["status"] == "completed" and j["result"] in (
+                        "copied", "copied_size_only"
+                    ):
+                        if lp not in cp_at or ts > cp_at[lp]:
+                            cp_at[lp] = ts
+        out: set[str] = set()
+        for lp in uniq:
+            d = del_at.get(lp)
+            c = cp_at.get(lp)
+            if d and c and c >= d:
+                out.add(lp)
+        return out
+
     def orphan_ids_pending_in_parent(self, parent_dir: str) -> list[int]:
         """P14 §3.4 — 그 폴더의 pending B/C id (id ASC). 폴더 단위 일괄 처리용.
 
         parent_dir 은 DB 에 저장된 절대경로 완전일치. 빈 문자열이면 [].
+
+        P15 §2.3 — 결과 집합만 줄인다: 메타파일 이름과, job 이력상 덮어쓰기된
+        경로(status 가 아직 pending 이어도)를 뺀다. 폴더 버튼의 유일한 대상 선정이다.
         """
         if not parent_dir:
             return []
         with self._reader() as conn:
             cur = conn.execute(
-                """SELECT id FROM orphan
+                """SELECT id, name, local_path FROM orphan
                     WHERE status='pending' AND class IN ('B','C') AND parent_dir=?
                     ORDER BY id ASC""",
                 (parent_dir,),
             )
-            return [int(r["id"]) for r in cur.fetchall()]
+            rows = [dict(r) for r in cur.fetchall()]
+        superseded = self.orphan_superseded_paths(
+            [str(r.get("local_path") or "") for r in rows]
+        )
+        return [
+            int(r["id"]) for r in rows
+            if not is_orphan_meta_name(r.get("name") or "")
+            and str(r.get("local_path") or "") not in superseded
+        ]
 
     def orphan_update(self, orphan_id: int, **fields) -> None:
         """§3.4 — 허용 키만 기록. 그 외 KeyError. 빈 fields 면 no-op."""
