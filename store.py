@@ -1320,8 +1320,9 @@ class Store:
 
         입력의 각 경로에 대해 job 이력만 본다 (§0.2/§0.3/§0.5):
           del_at = MAX(created_at WHERE action='delete')
-          cp_at  = MAX(created_at WHERE status='completed'
+          cp_at  = MAX(created_at WHERE (status='completed'
                         AND result IN ('copied','copied_size_only'))
+                        OR (status='skipped' AND result='duplicate'))
           superseded ⇔ del_at 과 cp_at 이 모두 있고 cp_at >= del_at
         크기·md5·orphan.created_at·job.id 대소·finished_at 은 쓰지 않는다.
         빈 입력 → set(). `idx_job_local_path` 전제 (상관 서브쿼리 금지 — IN 배치 1회).
@@ -1342,7 +1343,8 @@ class Store:
                          WHERE local_path IN ({placeholders})
                            AND (action='delete'
                                 OR (status='completed'
-                                    AND result IN ('copied','copied_size_only')))""",
+                                    AND result IN ('copied','copied_size_only'))
+                                OR (status='skipped' AND result='duplicate'))""",
                     chunk,
                 )
                 for j in cur.fetchall():
@@ -1351,9 +1353,11 @@ class Store:
                     if j["action"] == "delete":
                         if lp not in del_at or ts > del_at[lp]:
                             del_at[lp] = ts
-                    if j["status"] == "completed" and j["result"] in (
+                    # 'duplicate' = D1: 그 경로의 로컬 파일이 새 file_id 의 구드 파일과
+                    # 같다 (구드에서 같은 파일이 새 ID 로 재업로드된 경우). 살아있다.
+                    if (j["status"] == "completed" and j["result"] in (
                         "copied", "copied_size_only"
-                    ):
+                    )) or (j["status"] == "skipped" and j["result"] == "duplicate"):
                         if lp not in cp_at or ts > cp_at[lp]:
                             cp_at[lp] = ts
         out: set[str] = set()

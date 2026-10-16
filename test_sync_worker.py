@@ -4567,6 +4567,42 @@ def test_T_P15_13_superseded_lookup_failure_aborts_batch():
     print("  OK T-P15-13 superseded 조회 실패 → fail-closed, 파일 유지")
 
 
+def test_T_P15_14_reuploaded_same_file_is_superseded_not_isolated():
+    """T-P15-14 — 구드가 같은 파일을 새 file_id 로 재업로드(옛 ID delete, 새 ID create).
+
+    새 create 는 D1 로 skipped/duplicate 라 copied 가 아니다. 그래도 로컬 파일은 구드의
+    현재 파일과 같으니 격리 금지. 같은 폴더의 진짜 삭제 파일(#347)만 격리 대상이다.
+    """
+    from plugins.metadata.gdrive_reading_sync.sync_worker import classify_pending_orphans
+    root = Path(tempfile.mkdtemp()) / "READING"
+    pdir = str(root / "만화" / "책")
+    live = _orphan_file(root, "만화/책/단권#345.zip", b"LIVE_REUPLOADED")
+    gone = _orphan_file(root, "만화/책/01권 完#347.zip", b"REALLY_DELETED")
+    md5 = _file_bytes_md5(b"LIVE_REUPLOADED")
+    store = _store()
+    live_id = _orphan_row(store, str(live), md5=md5, size=15, klass="C", job_id=1)
+    gone_id = _orphan_row(store, str(gone), klass="C", job_id=2)
+    _seed_job_row(store, event_key="ek:p15:14:cp0", action="create",
+                  local_path=str(live), created_at="2026-10-14T08:43:27",
+                  status="completed", result="copied")
+    _seed_job_row(store, event_key="ek:p15:14:del", action="delete",
+                  local_path=str(live), created_at="2026-10-14T08:44:15",
+                  status="skipped", result="remote_deleted")
+    _seed_job_row(store, event_key="ek:p15:14:dup", action="create",
+                  local_path=str(live), created_at="2026-10-14T08:44:15",
+                  status="skipped", result="duplicate")
+    _seed_job_row(store, event_key="ek:p15:14:gdel", action="delete",
+                  local_path=str(gone), created_at="2026-10-14T08:44:15",
+                  status="skipped", result="remote_deleted")
+    cfg = dict(CFG, LOCAL_ROOT=str(root))
+    classify_pending_orphans(store, cfg, log=lambda *a: None)
+    assert store.orphan_get(live_id)["status"] == "superseded", store.orphan_get(live_id)
+    assert store.orphan_get(gone_id)["status"] == "pending", store.orphan_get(gone_id)
+    assert store.orphan_ids_pending_in_parent(pdir) == [gone_id]
+    assert live.is_file() and gone.is_file()
+    print("  OK T-P15-14 재업로드(duplicate) → superseded, 진짜 삭제분만 격리 대상")
+
+
 if __name__ == "__main__":
     tests = [
         # 기존 6종 (1라운드 회귀)
@@ -4736,6 +4772,7 @@ if __name__ == "__main__":
         test_T_P15_12_parent_ids_exclude_meta_without_breaking_p14_10,
         # 보정 라운드 1 — superseded 조회 실패 fail-closed (신규 1종)
         test_T_P15_13_superseded_lookup_failure_aborts_batch,
+        test_T_P15_14_reuploaded_same_file_is_superseded_not_isolated,
     ]
     for fn in tests:
         fn()
